@@ -1,0 +1,44 @@
+[package]
+name = "rustld"
+version = "0.1.0"
+edition = "2021"
+description = "A modern ELF loader (static & dynamic linker + compatible glibc & musl) written in Rust"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+
+# Comment all profile.release settings
+# RUSTFLAGS="-C force-frame-pointers=yes" cargo flamegraph --profile profiling --example rustld -- /bin/pwd
+# grep -oP '(?<=<title>).*?(?=</title>)' flamegraph.svg > titles.txt
+[profile.profiling]
+inherits = "release"
+debug = true
+lto = false
+codegen-units = 1
+strip = false
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+# lto = "fat"
+
+[profile.dev]
+panic = "abort"
+incremental = true
+debug = true
+
+[features]
+default = ["mmap_allocator"]
+custom_start = []
+mmap_allocator = []
+
+[dependencies]
+memchr = { version = "2.8.0", default-features = false }
+phf = { version = "0.13.1", default-features = false, features = ["macros"] }
+rustc-hash = "2.1.1"
+smallvec = { version = "1.15.1", default-features = false }
+smartstring = { version = "1.0.1", default-features = false }
