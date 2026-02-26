@@ -46,6 +46,7 @@ pub struct JumpInfo {
 }
 
 const AUXV_MAX: usize = 64;
+const SHN_ABS: u16 = 0xfff1;
 
 unsafe fn dependency_init_order(linker: &DynamicLinker, start_idx: usize) -> SmallVec<[usize; 32]> {
     fn visit(
@@ -106,6 +107,8 @@ pub unsafe fn execute_elf_from_bytes(
     hwcap: usize,
     hwcap2: usize,
     auxv_template: &[AuxiliaryVectorItem],
+    entry_symbol: Option<&str>,
+    entry_address: Option<usize>,
     verbose: bool,
 ) -> JumpInfo {
     launch_target_with_source(
@@ -118,6 +121,8 @@ pub unsafe fn execute_elf_from_bytes(
         hwcap,
         hwcap2,
         auxv_template,
+        entry_symbol,
+        entry_address,
         verbose,
     )
 }
@@ -133,6 +138,8 @@ unsafe fn launch_target_with_source(
     hwcap: usize,
     hwcap2: usize,
     auxv_template: &[AuxiliaryVectorItem],
+    entry_symbol: Option<&str>,
+    entry_address: Option<usize>,
     verbose: bool,
 ) -> JumpInfo {
     let target_path = *target_argv;
@@ -142,6 +149,7 @@ unsafe fn launch_target_with_source(
         TargetImageSource::Path => load_target_image(target_path),
         TargetImageSource::Bytes(bytes) => load_target_image_from_bytes(bytes),
     };
+    let mut selected_entry = image.entry;
 
     if verbose {
         announce_target_elf_kind(&image);
@@ -177,6 +185,7 @@ unsafe fn launch_target_with_source(
         .map(|value| value.as_ptr() as *const u8)
         .collect();
     let _leaked_env_storage = Box::leak(env_storage.into_boxed_slice());
+    maybe_disable_glibc_rseq_under_valgrind(&mut env_list);
     maybe_force_c_locale(&mut env_list);
     let auxv_string_storage = stabilize_auxv_string_pointers(&mut auxv_items);
     let _leaked_auxv_string_storage = Box::leak(auxv_string_storage.into_boxed_slice());
@@ -352,6 +361,14 @@ unsafe fn launch_target_with_source(
             }
         }
         relocation::apply_irelative_relocations(&ifuncs);
+        selected_entry = resolve_requested_entry_for_dynamic(
+            entry_symbol,
+            entry_address,
+            &linker,
+            executable_idx,
+            image.base,
+            selected_entry,
+        );
         if !musl_target {
             // Constructors and libc early init expect stack-end metadata to match
             // the argv/env/auxv image we hand to the target process.
@@ -493,11 +510,23 @@ unsafe fn launch_target_with_source(
         let mut objects = vec![executable];
         tls::prepare_tls_layout(&mut objects);
         tls::install_tls(&objects, pseudorandom_bytes);
+        selected_entry = resolve_requested_entry_for_static(
+            entry_symbol,
+            entry_address,
+            &objects[0],
+            image.base,
+            selected_entry,
+        );
         core::mem::forget(objects);
     }
 
+    set_auxv_ptr(&mut auxv_items, AT_ENTRY, selected_entry as *mut ());
+    let new_auxv =
+        new_stack.add(1 + (target_argc + 1) + (env_list.len() + 1)) as *mut AuxiliaryVectorItem;
+    set_auxv_val_in_place(new_auxv, AT_ENTRY, selected_entry);
+
     JumpInfo {
-        entry: image.entry,
+        entry: selected_entry,
         stack: new_stack as usize,
     }
 }
@@ -573,6 +602,93 @@ unsafe fn collect_startup_symbol_writes(
     }
 
     writes
+}
+
+#[inline(always)]
+fn resolve_entry_address_for_object(
+    object_base: usize,
+    object_map_start: usize,
+    object_map_end: usize,
+    requested: usize,
+) -> usize {
+    if requested >= object_map_start && requested < object_map_end {
+        requested
+    } else {
+        object_base.wrapping_add(requested)
+    }
+}
+
+unsafe fn resolve_requested_entry_for_dynamic(
+    entry_symbol: Option<&str>,
+    entry_address: Option<usize>,
+    linker: &DynamicLinker,
+    executable_idx: usize,
+    executable_base: usize,
+    default_entry: usize,
+) -> usize {
+    match (entry_symbol, entry_address) {
+        (None, None) => default_entry,
+        (Some(symbol_name), None) => {
+            if let Some(address) = linker.lookup_symbol_in_object_scope(executable_idx, symbol_name)
+            {
+                return address;
+            }
+            if let Some((object_idx, symbol)) = linker.lookup_symbol(symbol_name) {
+                let base = if symbol.st_shndx == SHN_ABS {
+                    0
+                } else {
+                    linker.get_base(object_idx)
+                };
+                return base.wrapping_add(symbol.st_value);
+            }
+            eprintln!("Error: entry symbol not found: {symbol_name}");
+            exit::exit(1);
+        }
+        (None, Some(requested_address)) => {
+            let (map_start, map_end) = linker
+                .object_map_range(executable_idx)
+                .unwrap_or((executable_base, executable_base));
+            resolve_entry_address_for_object(executable_base, map_start, map_end, requested_address)
+        }
+        (Some(_), Some(_)) => {
+            eprintln!("Error: entry_symbol and entry_address are mutually exclusive");
+            exit::exit(1);
+        }
+    }
+}
+
+unsafe fn resolve_requested_entry_for_static(
+    entry_symbol: Option<&str>,
+    entry_address: Option<usize>,
+    executable: &SharedObject,
+    executable_base: usize,
+    default_entry: usize,
+) -> usize {
+    match (entry_symbol, entry_address) {
+        (None, None) => default_entry,
+        (Some(symbol_name), None) => {
+            if let Some(symbol) = executable.lookup_exported_symbol(symbol_name) {
+                let base = if symbol.st_shndx == SHN_ABS {
+                    0
+                } else {
+                    executable.base
+                };
+                return base.wrapping_add(symbol.st_value);
+            }
+            eprintln!("Error: entry symbol not found in image: {symbol_name}");
+            exit::exit(1);
+        }
+        (None, Some(requested_address)) => resolve_entry_address_for_object(
+            executable_base,
+            executable.map_start,
+            executable.map_end,
+            requested_address,
+        ),
+        (Some(_), Some(_)) => {
+            eprintln!("Error: entry_symbol and entry_address are mutually exclusive");
+            exit::exit(1);
+        }
+    }
 }
 
 unsafe fn symbol_address_any(linker: &DynamicLinker, name: &str) -> Option<usize> {
@@ -1060,6 +1176,29 @@ fn maybe_force_c_locale(env: &mut Vec<*const u8>) {
     }
 
     env.push(core::ptr::addr_of_mut!(LC_ALL_C).cast::<u8>() as *const u8);
+}
+
+fn maybe_disable_glibc_rseq_under_valgrind(env: &mut Vec<*const u8>) {
+    if !running_under_valgrind() {
+        return;
+    }
+
+    static mut GLIBC_TUNABLES_RSEQ_OFF: [u8; 36] = *b"GLIBC_TUNABLES=glibc.pthread.rseq=0\0";
+    const GLIBC_TUNABLES_KEY: &[u8] = b"GLIBC_TUNABLES=";
+    let tunables_ptr = core::ptr::addr_of_mut!(GLIBC_TUNABLES_RSEQ_OFF).cast::<u8>() as *const u8;
+
+    for slot in env.iter_mut() {
+        if slot.is_null() {
+            continue;
+        }
+        let bytes = unsafe { CStr::from_ptr((*slot).cast::<c_char>()).to_bytes() };
+        if bytes.starts_with(GLIBC_TUNABLES_KEY) {
+            *slot = tunables_ptr;
+            return;
+        }
+    }
+
+    env.push(tunables_ptr);
 }
 
 fn env_find_key<'a>(env: &'a [*const u8], key: &[u8]) -> Option<&'a [u8]> {

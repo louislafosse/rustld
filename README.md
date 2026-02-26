@@ -7,6 +7,7 @@ A modern x86_64 & AArch64 ELF loader (static & dynamic linker + compatible glibc
 # Run any binary (static, glibc, musl) on host arch
 cargo build --release --example rustld
 ./target/release/examples/rustld /bin/ls
+./target/release/examples/rustld --entry-symbol hello ./tests/libhello.so
 
 # If you want to embed the custom linker path into your binary
 cd examples/ld_interp && cargo build --release && cd ../..
@@ -27,13 +28,25 @@ gcc -O2 -I./include -o ./target/release/examples/rustld_c ./examples/rustld_c.c 
 // See exact implementation in ./examples/rustld.rs
 rustld::ElfLoader::execute_from_bytes(
     target_bytes,
-    target_argc,
-    target_argv,
-    host_env_pointer,
-    &auxv_items,
+    target_argv,      // Vec<String>, argv[0] = target path
+    None,             // env override (None => parent env)
+    None,             // auxv override (None => parent auxv)
     false,
 );
 
+// Optional explicit entrypoint (shared object symbol or address)
+rustld::ElfLoader::execute_from_bytes_with_entry(
+    target_bytes,
+    target_argv,
+    Some("hello"),    // or None
+    None,             // or Some(0x399)
+    None,
+    None,
+    false,
+);
+```
+
+```c
 // In C :
 // See exact implementation in ./examples/rustld_c.c
 #include "rustld.h"
@@ -47,6 +60,21 @@ int32_t rc = rustld_elfloader_execute_from_bytes(
     NULL,                   // auxv override (NULL => parent auxv)
     0,                      // auxv_len
     0                       // verbose
+);
+
+// Optional explicit entrypoint override
+int32_t rc2 = rustld_elfloader_execute_from_bytes_with_entry(
+    target_bytes,
+    target_len,
+    target_argc,
+    target_argv,
+    "hello",               // entry symbol (or NULL)
+    0x399,                  // entry address
+    0,                      // entry_address_is_set (set 1 to use address)
+    NULL,
+    NULL,
+    0,
+    0
 );
 ```
 

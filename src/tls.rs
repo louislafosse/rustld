@@ -20,6 +20,10 @@ const GLIBC_PTHREAD_TID_OFFSET: usize = 0x2d0;
 const GLIBC_PTHREAD_LIST_OFFSET: usize = 0x2c0;
 #[cfg(target_arch = "x86_64")]
 const GLIBC_TSD_KEY_BLOCK_OFFSET: isize = -0x28;
+#[cfg(target_arch = "x86_64")]
+const GLIBC_RSEQ_AREA_OFFSET: isize = -192;
+#[cfg(target_arch = "x86_64")]
+const GLIBC_RSEQ_AREA_SIZE: usize = 32;
 
 pub struct TlsState {
     pub tcb: *mut ThreadControlBlock,
@@ -157,17 +161,11 @@ pub struct TlsLayout {
 }
 
 pub unsafe fn prepare_tls_layout(objects: &mut [SharedObject]) {
-    // Reserve a private per-thread area immediately below TP for rseq.
-    // This keeps glibc start_thread's memset/rseq registration from
-    // clobbering module TLS variables.
-    // glibc reads/writes per-thread rseq data at tp + __rseq_offset.
-    // Our rtld stubs expose __rseq_offset = -192, so reserve enough
-    // bytes below TP for that window and future small growth.
-    const RSEQ_RESERVE_BYTES: usize = 1024;
-    // Reserve a static-TLS surplus window for modules loaded by dlopen().
-    // This prevents TP-relative relocations (R_X86_64_TPOFF*) from being
-    // resolved as dynamic-TLS for many common plugin stacks.
-    const RUNTIME_STATIC_SURPLUS_BYTES: usize = 256 * 1024;
+    // Reserve a small fixed window below TP so glibc's rseq scratch area
+    // (TP-192..TP-160 on x86_64) does not overlap any module TLS bytes.
+    // Keep this modest (not the old large surplus) to avoid startup regressions.
+    const RSEQ_RESERVE_BYTES: usize = 256;
+    const RUNTIME_STATIC_SURPLUS_BYTES: usize = 0;
     let mut module_id = 1usize;
     let mut max_align = align_of::<ThreadControlBlock>();
 
@@ -527,6 +525,15 @@ unsafe fn initialize_tls_block(
     if clone_full_tcb {
         let tsd_key_slot = (tcb as *mut u8).offset(GLIBC_TSD_KEY_BLOCK_OFFSET) as *mut usize;
         core::ptr::write_volatile(tsd_key_slot, 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if !clone_full_tcb {
+        // glibc start_thread registers rseq for child threads using an area at
+        // TP-192 (32 bytes on x86_64). Ensure this window is initialized even
+        // when we preserve the rest of the caller-provided pthread block.
+        let rseq_area = (tcb as *mut u8).offset(GLIBC_RSEQ_AREA_OFFSET);
+        core::ptr::write_bytes(rseq_area, 0, GLIBC_RSEQ_AREA_SIZE);
     }
     register_thread_tcb(tcb);
 

@@ -264,24 +264,26 @@ impl RtldStubs {
         let stack_chk_guard = rtld_data.byte_add(0x38) as *mut usize;
         let auxv_storage = rtld_data.byte_add(0x40) as *mut AuxiliaryVectorItem;
 
-        // Seed rseq metadata exposed via ld-linux globals.
         #[cfg(target_arch = "x86_64")]
         {
-            // glibc x86_64 defaults exposed by ld-linux:
-            //   __rseq_offset = -192, __rseq_size = 28, __rseq_flags = 0.
-            *rseq_offset = -192;
-            *rseq_size = 28;
-            *rseq_flags = 0;
+            if running_under_valgrind() {
+                // Valgrind does not model rseq registration like native glibc
+                // startup expects; advertise rseq as disabled in this mode.
+                *rseq_offset = 0;
+                *rseq_size = 0;
+                *rseq_flags = 0;
+            } else {
+                // Match glibc x86_64 ABI: rseq state lives below TP.
+                // offset=0 causes child threads to overwrite the TCB.
+                *rseq_offset = -192;
+                *rseq_size = 32;
+                *rseq_flags = 0;
+            }
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(not(target_arch = "x86_64"))]
         {
-            // Keep rseq disabled unless explicitly initialized for this arch.
-            *rseq_offset = 0;
-            *rseq_size = 0;
-            *rseq_flags = 0;
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
+            // Keep conservative defaults on other architectures until their
+            // exact glibc layout is wired here.
             *rseq_offset = 0;
             *rseq_size = 0;
             *rseq_flags = 0;
@@ -342,15 +344,15 @@ impl RtldStubs {
         *(rtld_global_ro.byte_add(0x20) as *mut usize) = minsigstacksize.max(2048);
         // libc dispatches dlopen/dlsym helpers through function pointers here.
         *(rtld_global_ro.byte_add(0x340) as *mut usize) =
-            ld_stubs::__rustld_rtld_lookup_symbol_x_stub as usize;
+            ld_stubs::__rustld_rtld_lookup_symbol_x_stub as *const () as usize;
         *(rtld_global_ro.byte_add(0x348) as *mut usize) =
-            ld_stubs::__rustld_rtld_dlopen_stub as usize;
+            ld_stubs::__rustld_rtld_dlopen_stub as *const () as usize;
         *(rtld_global_ro.byte_add(0x350) as *mut usize) =
-            ld_stubs::__rustld_rtld_dlclose_stub as usize;
+            ld_stubs::__rustld_rtld_dlclose_stub as *const () as usize;
         *(rtld_global_ro.byte_add(0x358) as *mut usize) =
-            ld_stubs::__rustld_rtld_catch_error as usize;
+            ld_stubs::__rustld_rtld_catch_error as *const () as usize;
         *(rtld_global_ro.byte_add(0x360) as *mut usize) =
-            ld_stubs::__rustld_rtld_error_free as usize;
+            ld_stubs::__rustld_rtld_error_free as *const () as usize;
         // __libc_early_init reads static TLS size/alignment from these fields.
         // Keep non-zero defaults to avoid division-by-zero before TLS layout is known.
         *(rtld_global_ro.byte_add(0x2A0) as *mut usize) = 0x1000; // _dl_tls_static_size (default)
@@ -794,7 +796,14 @@ impl DynamicLinker {
         tls::prepare_tls_layout(&mut self.objects);
         let layout = tls::tls_layout();
         if let Some(stubs) = self.rtld_stubs.as_ref() {
-            stubs.set_rseq_metadata(-192, 28, 0);
+            #[cfg(target_arch = "x86_64")]
+            if running_under_valgrind() {
+                stubs.set_rseq_metadata(0, 0, 0);
+            } else {
+                stubs.set_rseq_metadata(-192, 32, 0);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            stubs.set_rseq_metadata(0, 0, 0);
         }
         if let (Some(stubs), Some(layout)) = (self.rtld_stubs.as_ref(), layout) {
             let tls_static_size = layout.tls_size

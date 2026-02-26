@@ -13,7 +13,7 @@ use crate::{
 };
 use core::ffi::{c_char, c_void};
 use core::mem::{size_of, MaybeUninit};
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 const SHN_ABS: u16 = 0xfff1;
 
@@ -79,7 +79,6 @@ static mut RTLD_LOOKUP_MAP: LookupLinkMap = LookupLinkMap {
     l_name: core::ptr::null(),
     l_ld: core::ptr::null(),
 };
-static DL_FINI_CALLED: AtomicBool = AtomicBool::new(false);
 static mut RTLD_LOOKUP_SYMBOL: MaybeUninit<Symbol> = MaybeUninit::uninit();
 
 static mut DLERROR_BUF: [u8; 256] = [0; 256];
@@ -92,10 +91,29 @@ const DLERROR_BUF_SIZE: usize = 256;
 static RTLD_LOCK_OWNER_TID: AtomicI32 = AtomicI32::new(0);
 static RTLD_LOCK_DEPTH: AtomicU32 = AtomicU32::new(0);
 
-struct RtldOpGuard;
+struct RtldOpGuard {
+    tid: i32,
+    locked: bool,
+}
 
 impl Drop for RtldOpGuard {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if !self.locked || self.tid <= 0 {
+            return;
+        }
+
+        if RTLD_LOCK_OWNER_TID.load(Ordering::Acquire) != self.tid {
+            return;
+        }
+
+        let depth = RTLD_LOCK_DEPTH.load(Ordering::Acquire);
+        if depth <= 1 {
+            RTLD_LOCK_DEPTH.store(0, Ordering::Release);
+            RTLD_LOCK_OWNER_TID.store(0, Ordering::Release);
+        } else {
+            RTLD_LOCK_DEPTH.store(depth - 1, Ordering::Release);
+        }
+    }
 }
 
 #[inline(always)]
@@ -121,7 +139,14 @@ fn thread_still_alive(tid: i32) -> bool {
 
 #[inline(always)]
 fn force_unlock_rtld_ops_if_owned_by_current_thread() {
-    let _ = current_tid();
+    let tid = current_tid();
+    if tid <= 0 {
+        return;
+    }
+    if RTLD_LOCK_OWNER_TID.load(Ordering::Acquire) == tid {
+        RTLD_LOCK_DEPTH.store(0, Ordering::Release);
+        RTLD_LOCK_OWNER_TID.store(0, Ordering::Release);
+    }
 }
 
 #[inline(always)]
@@ -214,9 +239,56 @@ unsafe fn catch_error_restore_top(
 
 #[inline(always)]
 fn lock_rtld_ops() -> RtldOpGuard {
-    // Temporarily disabled: lock contention/regressions caused user-space spins
-    // for some binaries (id/curl). Keep guard call sites unchanged.
-    RtldOpGuard
+    let tid = current_tid();
+    if tid <= 0 {
+        return RtldOpGuard {
+            tid: 0,
+            locked: false,
+        };
+    }
+
+    let mut spins = 0usize;
+    loop {
+        let owner = RTLD_LOCK_OWNER_TID.load(Ordering::Acquire);
+        let depth = RTLD_LOCK_DEPTH.load(Ordering::Acquire);
+
+        if owner == tid {
+            RTLD_LOCK_DEPTH.store(depth.saturating_add(1), Ordering::Release);
+            return RtldOpGuard { tid, locked: true };
+        }
+
+        if owner == 0 {
+            if RTLD_LOCK_OWNER_TID
+                .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                RTLD_LOCK_DEPTH.store(1, Ordering::Release);
+                return RtldOpGuard { tid, locked: true };
+            }
+            core::hint::spin_loop();
+            continue;
+        }
+
+        // Recover from stale ownership metadata if a thread exited while
+        // holding the lock or lock metadata was left inconsistent.
+        if depth == 0 || !thread_still_alive(owner) {
+            if RTLD_LOCK_OWNER_TID
+                .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                RTLD_LOCK_DEPTH.store(0, Ordering::Release);
+                continue;
+            }
+        }
+
+        spins = spins.wrapping_add(1);
+        if spins & 0x3ff == 0 {
+            // Keep spinning lock simple/no-allocation: just issue a pause hint.
+            core::hint::spin_loop();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 #[no_mangle]
@@ -282,25 +354,12 @@ pub extern "C" fn __libc_freeres() {
     // libc internals to avoid touching uninitialized rtld state.
 }
 
-#[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub extern "C" fn _dl_fini() {
-    // AArch64 teardown currently loops in libc/rtld cleanup paths.
+    // Keep rtld_fini as a no-op so process exit can complete reliably.
+    // Invoking custom fini walks here can recurse into partially-torn-down
+    // runtime state for some binaries.
     // Keep rtld_fini as a no-op so process exit can complete.
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[no_mangle]
-pub extern "C" fn _dl_fini() {
-    if DL_FINI_CALLED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let _guard = lock_rtld_ops();
-    unsafe {
-        if let Some(linker) = linking::active_linker() {
-            linker.call_fini_for_loaded_objects();
-        }
-    }
 }
 
 type DlsymEntry = unsafe extern "C" fn(*mut c_void, *const u8) -> *mut c_void;
@@ -1399,19 +1458,37 @@ pub extern "C" fn _dl_allocate_tls(_mem: *mut ()) -> *mut () {
 
 #[no_mangle]
 pub extern "C" fn _dl_allocate_tls_init(tcb: *mut (), _main_thread: usize) -> *mut () {
-    // glibc may call this after mutating thread-descriptor fields. Re-apply
-    // our TLS/TCB setup so fs:tcb/dtv/self pointers remain valid.
+    // glibc may call this on a descriptor that was already initialized by
+    // _dl_allocate_tls(). Keep this idempotent and avoid clobbering fields
+    // that libc/pthread populated between the two calls.
+    #[repr(C)]
+    struct TcbHead {
+        _tcb: *mut ThreadControlBlock,
+        dtv: *mut usize,
+    }
+
     unsafe {
         __rustld_last_alloc_tls_init_arg = tcb;
         if !tcb.is_null() {
-            if let Some(initialized) = tls::initialize_tls_for_thread_ptr(tcb) {
-                let current_tp = get_thread_pointer() as *mut ThreadControlBlock;
-                if !current_tp.is_null() && current_tp == initialized {
-                    tls::stamp_thread_tid(initialized);
+            let head = tcb as *mut TcbHead;
+            let already_initialized = !(*head).dtv.is_null();
+            if !already_initialized {
+                if let Some(initialized) = tls::initialize_tls_for_thread_ptr(tcb) {
+                    let current_tp = get_thread_pointer() as *mut ThreadControlBlock;
+                    if !current_tp.is_null() && current_tp == initialized {
+                        tls::stamp_thread_tid(initialized);
+                    }
+                    let result = initialized.cast();
+                    __rustld_last_alloc_tls_init_ret = result;
+                    return result;
                 }
-                let result = initialized.cast();
-                __rustld_last_alloc_tls_init_ret = result;
-                return result;
+            } else {
+                let current_tp = get_thread_pointer() as *mut ThreadControlBlock;
+                if !current_tp.is_null() && core::ptr::eq(current_tp.cast::<()>(), tcb) {
+                    tls::stamp_thread_tid(current_tp);
+                }
+                __rustld_last_alloc_tls_init_ret = tcb;
+                return tcb;
             }
         }
         let current_tp = get_thread_pointer();
@@ -1679,7 +1756,7 @@ pub extern "C" fn _dl_rtld_di_serinfo() -> *const () {
 #[no_mangle]
 pub extern "C" fn __tunable_is_initialized(_id: usize) -> i32 {
     if let Some(addr) = unsafe { linking::lookup_active_symbol("__tunable_is_initialized") } {
-        let self_addr = __tunable_is_initialized as usize;
+        let self_addr = __tunable_is_initialized as *const () as usize;
         if addr != self_addr {
             unsafe {
                 let func: extern "C" fn(usize) -> i32 = core::mem::transmute(addr);
@@ -1693,7 +1770,7 @@ pub extern "C" fn __tunable_is_initialized(_id: usize) -> i32 {
 #[no_mangle]
 pub extern "C" fn __tunable_get_val(_id: usize, valp: *mut (), callback: *const ()) {
     if let Some(addr) = unsafe { linking::lookup_active_symbol("__tunable_get_val") } {
-        let self_addr = __tunable_get_val as usize;
+        let self_addr = __tunable_get_val as *const () as usize;
         if addr != self_addr {
             unsafe {
                 let func: extern "C" fn(usize, *mut (), *const ()) = core::mem::transmute(addr);

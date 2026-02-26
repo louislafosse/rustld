@@ -150,3 +150,73 @@ pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes(
         Err(_) => RUSTLD_EPANIC,
     }
 }
+
+/// C ABI wrapper over `ElfLoader::execute_from_bytes_with_entry`.
+///
+/// Pass either `entry_symbol` (non-null) or set `entry_address_is_set != 0`.
+/// Returns only on error. On success, control jumps to selected entrypoint.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes_with_entry(
+    elf_bytes: *const u8,
+    elf_len: usize,
+    argc: usize,
+    argv: *const *const c_char,
+    entry_symbol: *const c_char,
+    entry_address: usize,
+    entry_address_is_set: i32,
+    envp: *const *const c_char,
+    auxv: *const RustLdAuxvItem,
+    auxv_len: usize,
+    verbose: i32,
+) -> i32 {
+    if elf_bytes.is_null() || elf_len == 0 {
+        return RUSTLD_EINVAL;
+    }
+
+    let args = match parse_argv(argc, argv) {
+        Some(value) => value,
+        None => return RUSTLD_EINVAL,
+    };
+    let bytes = core::slice::from_raw_parts(elf_bytes, elf_len);
+    let auxv_vec = parse_auxv(auxv, auxv_len);
+    let auxv_override = auxv_vec.as_deref();
+    let env_override = if envp.is_null() {
+        None
+    } else {
+        Some(envp as *const *const u8)
+    };
+    let symbol_override = if entry_symbol.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(entry_symbol).to_str() {
+            Ok(value) if !value.is_empty() => Some(value),
+            _ => return RUSTLD_EINVAL,
+        }
+    };
+    let address_override = if entry_address_is_set != 0 {
+        Some(entry_address)
+    } else {
+        None
+    };
+
+    if symbol_override.is_some() && address_override.is_some() {
+        return RUSTLD_EINVAL;
+    }
+
+    let result = std::panic::catch_unwind(|| unsafe {
+        ElfLoader::execute_from_bytes_with_entry(
+            bytes,
+            args,
+            symbol_override,
+            address_override,
+            env_override,
+            auxv_override,
+            verbose != 0,
+        );
+    });
+
+    match result {
+        Ok(()) => RUSTLD_EIO,
+        Err(_) => RUSTLD_EPANIC,
+    }
+}

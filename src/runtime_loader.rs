@@ -45,6 +45,18 @@ struct RuntimeMetadata {
 pub struct ElfLoader;
 
 impl ElfLoader {
+    #[inline(always)]
+    fn validate_entry_override(entry_symbol: Option<&str>, entry_address: Option<usize>) {
+        if entry_symbol.is_some() && entry_address.is_some() {
+            eprintln!("Error: entry_symbol and entry_address are mutually exclusive");
+            std::process::exit(1);
+        }
+        if entry_symbol.is_some_and(|symbol| symbol.is_empty()) {
+            eprintln!("Error: entry_symbol cannot be empty");
+            std::process::exit(1);
+        }
+    }
+
     /// Prepares a target ELF image and returns jump metadata.
     ///
     /// This does not jump to the target entry. It performs loading work and
@@ -73,6 +85,37 @@ impl ElfLoader {
         auxv_template: Option<&[AuxiliaryVectorItem]>,
         verbose: bool,
     ) -> JumpInfo {
+        Self::prepare_from_bytes_with_entry(
+            elf_bytes,
+            target_argv,
+            None,
+            None,
+            env_pointer,
+            auxv_template,
+            verbose,
+        )
+    }
+
+    /// Same as `prepare_from_bytes`, but allows overriding the entrypoint.
+    ///
+    /// Pass either:
+    ///
+    /// - `entry_symbol = Some("symbol_name")`, or
+    /// - `entry_address = Some(addr)` (absolute address or object-relative offset).
+    ///
+    /// Passing both is rejected.
+    #[inline(always)]
+    pub unsafe fn prepare_from_bytes_with_entry(
+        elf_bytes: &[u8],
+        target_argv: Vec<String>,
+        entry_symbol: Option<&str>,
+        entry_address: Option<usize>,
+        env_pointer: Option<*const *const u8>,
+        auxv_template: Option<&[AuxiliaryVectorItem]>,
+        verbose: bool,
+    ) -> JumpInfo {
+        Self::validate_entry_override(entry_symbol, entry_address);
+
         if target_argv.is_empty() {
             eprintln!("Error: target argv cannot be empty");
             std::process::exit(1);
@@ -133,6 +176,8 @@ impl ElfLoader {
             metadata.hwcap,
             metadata.hwcap2,
             auxv_template,
+            entry_symbol,
+            entry_address,
             verbose,
         )
     }
@@ -162,14 +207,52 @@ impl ElfLoader {
         auxv_template: Option<&[AuxiliaryVectorItem]>,
         verbose: bool,
     ) -> ! {
+        Self::execute_from_bytes_with_entry(
+            elf_bytes,
+            target_argv,
+            None,
+            None,
+            env_pointer,
+            auxv_template,
+            verbose,
+        )
+    }
+
+    /// Executes a target ELF and jumps to an explicit entrypoint override.
+    ///
+    /// Pass either:
+    ///
+    /// - `entry_symbol = Some("symbol_name")`, or
+    /// - `entry_address = Some(addr)` (absolute address or object-relative offset).
+    ///
+    /// Passing both is rejected.
+    #[inline(always)]
+    pub unsafe fn execute_from_bytes_with_entry(
+        elf_bytes: &[u8],
+        target_argv: Vec<String>,
+        entry_symbol: Option<&str>,
+        entry_address: Option<usize>,
+        env_pointer: Option<*const *const u8>,
+        auxv_template: Option<&[AuxiliaryVectorItem]>,
+        verbose: bool,
+    ) -> ! {
+        Self::validate_entry_override(entry_symbol, entry_address);
+
         let start_time = if verbose {
             Some(std::time::Instant::now())
         } else {
             None
         };
 
-        let jump =
-            Self::prepare_from_bytes(elf_bytes, target_argv, env_pointer, auxv_template, verbose);
+        let jump = Self::prepare_from_bytes_with_entry(
+            elf_bytes,
+            target_argv,
+            entry_symbol,
+            entry_address,
+            env_pointer,
+            auxv_template,
+            verbose,
+        );
 
         if verbose {
             let elapsed =
@@ -178,6 +261,16 @@ impl ElfLoader {
                 "rustld: loading completed in: {:.3}ms",
                 elapsed.as_secs_f64() * 1000.0
             );
+        }
+
+        if entry_symbol.is_some() || entry_address.is_some() {
+            let entry_fn: extern "C" fn() -> i32 = core::mem::transmute(jump.entry);
+            let code = entry_fn();
+            unsafe extern "C" {
+                fn fflush(stream: *mut core::ffi::c_void) -> i32;
+            }
+            let _ = fflush(core::ptr::null_mut());
+            std::process::exit(code);
         }
 
         jump_to_loaded_entry(jump);
@@ -193,7 +286,7 @@ unsafe fn jump_to_loaded_entry(jump: JumpInfo) -> ! {
             jump.entry, jump.stack
         );
     }
-    arch::jump_to_entry(jump.entry, jump.stack, _dl_fini as usize)
+    arch::jump_to_entry(jump.entry, jump.stack, _dl_fini as *const () as usize)
 }
 
 unsafe fn derive_runtime_metadata(auxv_template: &[AuxiliaryVectorItem]) -> RuntimeMetadata {

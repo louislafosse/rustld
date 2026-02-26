@@ -6,7 +6,7 @@ else
 fi
 
 if [ "$1" = "clean" ]; then
-    rm -rf ${PREFIX}hello_musl ${PREFIX}hello_static ${PREFIX}print_deadbeef ${PREFIX}sqrt_with_ld ${PREFIX}hello_arm64_musl ${PREFIX}hello_arm64_musl_static ${PREFIX}hello_arm64_glibc ${PREFIX}hello_arm64_glibc_static
+    rm -rf ${PREFIX}hello_musl ${PREFIX}hello_static ${PREFIX}print_deadbeef ${PREFIX}sqrt_with_ld ${PREFIX}hello_arm64_musl ${PREFIX}hello_arm64_musl_static ${PREFIX}hello_arm64_glibc ${PREFIX}hello_arm64_glibc_static ${PREFIX}libhello.so
     exit 0
 fi
 
@@ -23,3 +23,4 @@ zig cc -target aarch64-linux-gnu -O2 -dynamic \
     -Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1 \
     -o ${PREFIX}hello_arm64_glibc ${PREFIX}hello_static.c
 zig cc -target aarch64-linux-gnu -O2 -o ${PREFIX}hello_arm64_glibc_static ${PREFIX}hello_static.c
+gcc -fPIC -shared ${PREFIX}hello_dyn_lib.c -o ${PREFIX}libhello.so

@@ -7,16 +7,87 @@ fn main() {
         let argv_storage = collect_process_arguments();
 
         if argv_storage.len() < 2 {
-            eprintln!("Usage: rustld <program> [args...]");
+            eprintln!(
+                "Usage: rustld [--entry-symbol <name> | --entry-addr <addr>] <program> [args...]"
+            );
             std::process::exit(1);
         }
 
-        let target_bytes = map_file_readonly(OsStr::from_bytes(argv_storage[1].as_bytes()));
-        let target_argv: Vec<String> = argv_storage.into_iter().skip(1).collect();
+        let mut args = argv_storage.into_iter();
+        let _self_name = args.next();
+
+        let mut entry_symbol: Option<String> = None;
+        let mut entry_address: Option<usize> = None;
+        let mut target_argv: Vec<String> = Vec::new();
+
+        while let Some(arg) = args.next() {
+            if arg == "--entry-symbol" {
+                let Some(symbol) = args.next() else {
+                    eprintln!("Error: --entry-symbol expects a value");
+                    std::process::exit(1);
+                };
+                entry_symbol = Some(symbol);
+                continue;
+            }
+            if arg == "--entry-addr" {
+                let Some(raw_addr) = args.next() else {
+                    eprintln!("Error: --entry-addr expects a value");
+                    std::process::exit(1);
+                };
+                let parsed = parse_address(&raw_addr);
+                entry_address = Some(parsed);
+                continue;
+            }
+
+            target_argv.push(arg);
+            target_argv.extend(args);
+            break;
+        }
+
+        if target_argv.is_empty() {
+            eprintln!("Error: missing target program path");
+            std::process::exit(1);
+        }
+        if entry_symbol.is_some() && entry_address.is_some() {
+            eprintln!("Error: --entry-symbol and --entry-addr are mutually exclusive");
+            std::process::exit(1);
+        }
+
+        let target_bytes = map_file_readonly(OsStr::from_bytes(target_argv[0].as_bytes()));
 
         #[cfg(debug_assertions)]
         eprintln!("Executing target binary: {}", target_argv[0]);
-        ElfLoader::execute_from_bytes(target_bytes, target_argv, None, None, false);
+        if entry_symbol.is_some() || entry_address.is_some() {
+            ElfLoader::execute_from_bytes_with_entry(
+                target_bytes,
+                target_argv,
+                entry_symbol.as_deref(),
+                entry_address,
+                None,
+                None,
+                false,
+            );
+        } else {
+            ElfLoader::execute_from_bytes(target_bytes, target_argv, None, None, false);
+        }
+    }
+}
+
+fn parse_address(raw: &str) -> usize {
+    let (digits, radix) = if let Some(hex) = raw.strip_prefix("0x") {
+        (hex, 16)
+    } else if let Some(hex) = raw.strip_prefix("0X") {
+        (hex, 16)
+    } else {
+        (raw, 10)
+    };
+
+    match usize::from_str_radix(digits, radix) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("Error: invalid entry address: {raw}");
+            std::process::exit(1);
+        }
     }
 }
 

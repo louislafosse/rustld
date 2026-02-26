@@ -406,10 +406,10 @@ pub unsafe extern "C" fn __rustld_tlsdesc_resolver() -> usize {
 
 #[inline(always)]
 pub(crate) fn tlsdesc_resolver_addr() -> usize {
-    __rustld_tlsdesc_resolver as usize
+    __rustld_tlsdesc_resolver as *const () as usize
 }
 
 #[inline(always)]
 pub(crate) fn tlsdesc_return_addr() -> usize {
-    __rustld_tlsdesc_return as usize
+    __rustld_tlsdesc_return as *const () as usize
 }
