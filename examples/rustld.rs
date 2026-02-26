@@ -58,7 +58,7 @@ fn main() {
         #[cfg(debug_assertions)]
         eprintln!("Executing target binary: {}", target_argv[0]);
         if entry_symbol.is_some() || entry_address.is_some() {
-            ElfLoader::execute_from_bytes_with_entry(
+            ElfLoader::new_with_obf(true).execute_from_bytes_with_entry(
                 target_bytes,
                 target_argv,
                 entry_symbol.as_deref(),
@@ -68,7 +68,7 @@ fn main() {
                 false,
             );
         } else {
-            ElfLoader::execute_from_bytes(target_bytes, target_argv, None, None, false);
+            ElfLoader::new_with_obf(true).execute_from_bytes(target_bytes, target_argv, None, None, false);
         }
     }
 }

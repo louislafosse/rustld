@@ -3,6 +3,7 @@ use core::{
     ffi::{c_char, c_void},
 };
 use std::arch::naked_asm;
+use crate::syscall::trampoline::indirect_syscall6;
 
 #[inline(always)]
 pub(crate) unsafe fn current_stack_pointer() -> *const u8 {
@@ -23,70 +24,35 @@ pub(crate) unsafe fn openat_readonly(path_ptr: *const c_char) -> i32 {
 #[inline(always)]
 pub(crate) unsafe fn openat(dirfd: i32, path_ptr: *const c_char, flags: i32, mode: u32) -> isize {
     const OPENAT: usize = 257;
-    let rc: isize;
-    asm!(
-        "syscall",
-        inlateout("rax") OPENAT => rc,
-        in("rdi") dirfd as isize,
-        in("rsi") path_ptr,
-        in("rdx") flags as isize,
-        in("r10") mode as isize,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags),
-    );
-    rc
+    unsafe {
+        indirect_syscall6(
+            OPENAT,
+            dirfd as usize,
+            path_ptr as usize,
+            flags as usize,
+            mode as usize,
+            0,
+            0,
+        )
+    }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn read(fd: i32, buf: *mut c_void, len: usize) -> isize {
     const READ: usize = 0;
-    let rc: isize;
-    asm!(
-        "syscall",
-        inlateout("rax") READ => rc,
-        in("rdi") fd as isize,
-        in("rsi") buf,
-        in("rdx") len,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags),
-    );
-    rc
+    unsafe { indirect_syscall6(READ, fd as usize, buf as usize, len, 0, 0, 0) }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn write(fd: i32, buf: *const c_void, len: usize) -> isize {
     const WRITE: usize = 1;
-    let rc: isize;
-    asm!(
-        "syscall",
-        inlateout("rax") WRITE => rc,
-        in("rdi") fd as isize,
-        in("rsi") buf,
-        in("rdx") len,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags),
-    );
-    rc
+    unsafe { indirect_syscall6(WRITE, fd as usize, buf as usize, len, 0, 0, 0) }
 }
 
 #[inline(always)]
 pub(crate) fn close(fd: i32) -> isize {
     const CLOSE: usize = 3;
-    let rc: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") CLOSE => rc,
-            in("rdi") fd as isize,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack, preserves_flags),
-        );
-    }
-    rc
+    unsafe { indirect_syscall6(CLOSE, fd as usize, 0, 0, 0, 0, 0) }
 }
 
 #[inline(always)]
@@ -96,18 +62,17 @@ pub(crate) unsafe fn execve(
     envp: *const *const c_char,
 ) -> isize {
     const EXECVE: usize = 59;
-    let rc: isize;
-    asm!(
-        "syscall",
-        inlateout("rax") EXECVE => rc,
-        in("rdi") path_ptr,
-        in("rsi") argv,
-        in("rdx") envp,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags),
-    );
-    rc
+    unsafe {
+        indirect_syscall6(
+            EXECVE,
+            path_ptr as usize,
+            argv as usize,
+            envp as usize,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 #[inline(always)]
@@ -118,36 +83,13 @@ pub(crate) unsafe fn close_fd(fd: i32) {
 #[inline(always)]
 pub(crate) unsafe fn pread(fd: i32, buf: *mut u8, len: usize, offset: usize) -> isize {
     const PREAD64: usize = 17;
-    let rc: isize;
-    asm!(
-        "syscall",
-        inlateout("rax") PREAD64 => rc,
-        in("rdi") fd,
-        in("rsi") buf,
-        in("rdx") len,
-        in("r10") offset,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags),
-    );
-    rc
+    unsafe { indirect_syscall6(PREAD64, fd as usize, buf as usize, len, offset, 0, 0) }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn getrandom(buf: *mut u8, len: usize) -> isize {
     const GETRANDOM: usize = 318;
-    let rc: isize;
-    asm!(
-        "syscall",
-        inlateout("rax") GETRANDOM => rc,
-        in("rdi") buf,
-        in("rsi") len,
-        in("rdx") 0usize,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags),
-    );
-    rc
+    unsafe { indirect_syscall6(GETRANDOM, buf as usize, len, 0, 0, 0, 0) }
 }
 
 #[inline(always)]
@@ -239,52 +181,19 @@ pub(crate) unsafe fn jump_to_entry(entry: usize, stack: usize, rtld_fini: usize)
 #[inline(always)]
 pub(crate) fn gettid() -> i32 {
     const GETTID: usize = 186;
-    let tid: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") GETTID => tid,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack, preserves_flags),
-        );
-    }
-    tid as i32
+    unsafe { indirect_syscall6(GETTID, 0, 0, 0, 0, 0, 0) as i32 }
 }
 
 #[inline(always)]
 pub(crate) fn getpid() -> i32 {
     const GETPID: usize = 39;
-    let pid: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") GETPID => pid,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack, preserves_flags),
-        );
-    }
-    pid as i32
+    unsafe { indirect_syscall6(GETPID, 0, 0, 0, 0, 0, 0) as i32 }
 }
 
 #[inline(always)]
 pub(crate) fn tgkill(pid: i32, tid: i32, sig: i32) -> isize {
     const TGKILL: usize = 234;
-    let rc: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") TGKILL => rc,
-            in("rdi") pid as isize,
-            in("rsi") tid as isize,
-            in("rdx") sig as isize,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack, preserves_flags),
-        );
-    }
-    rc
+    unsafe { indirect_syscall6(TGKILL, pid as usize, tid as usize, sig as usize, 0, 0, 0) }
 }
 
 #[inline(always)]

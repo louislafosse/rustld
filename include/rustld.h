@@ -33,9 +33,13 @@ char **rustld_host_environment_pointer(void);
 /*
  * Wrapper around ElfLoader::prepare_from_bytes.
  *
+ * Does not jump; fills out_jump with entry/stack for a later handoff.
  * - envp == NULL: reuse parent environment.
  * - auxv == NULL or auxv_len == 0: reuse parent auxv.
- * - out_jump receives entry/stack jump metadata.
+ * - indirect_syscalls != 0: route all syscalls through an anonymous RX
+ *   trampoline page so the syscall opcode never appears in the loader image
+ *   (x86_64: 0x0F 0x05, aarch64: 0xD4000001). Recommended for anti-RE.
+ *   Pass 0 for conventional direct syscalls.
  */
 int32_t rustld_elfloader_prepare_from_bytes(
     const uint8_t *elf_bytes,
@@ -46,13 +50,16 @@ int32_t rustld_elfloader_prepare_from_bytes(
     const RustLdAuxvItem *auxv,
     size_t auxv_len,
     int32_t verbose,
+    int32_t indirect_syscalls,
     RustLdJumpInfo *out_jump
 );
 
 /*
  * Wrapper around ElfLoader::execute_from_bytes.
  *
- * Returns only on error. On success, transfers control to target entrypoint.
+ * Returns only on error; on success transfers control to target entrypoint.
+ * - indirect_syscalls != 0: trampoline mode — syscall opcode hidden from image
+ *   (x86_64: 0x0F 0x05, aarch64: 0xD4000001). Pass 0 for direct syscalls.
  */
 int32_t rustld_elfloader_execute_from_bytes(
     const uint8_t *elf_bytes,
@@ -62,17 +69,17 @@ int32_t rustld_elfloader_execute_from_bytes(
     const char *const *envp,
     const RustLdAuxvItem *auxv,
     size_t auxv_len,
-    int32_t verbose
+    int32_t verbose,
+    int32_t indirect_syscalls
 );
 
 /*
  * Wrapper around ElfLoader::execute_from_bytes_with_entry.
  *
- * - entry_symbol != NULL: resolve and jump to that symbol.
- * - entry_address_is_set != 0: use entry_address.
- * - Do not provide both at once.
- *
- * Returns only on error. On success, transfers control to selected entrypoint.
+ * Pass either entry_symbol (non-NULL) or entry_address_is_set != 0, not both.
+ * Returns only on error; on success transfers control to selected entrypoint.
+ * - indirect_syscalls != 0: trampoline mode — syscall opcode hidden from image
+ *   (x86_64: 0x0F 0x05, aarch64: 0xD4000001). Pass 0 for direct syscalls.
  */
 int32_t rustld_elfloader_execute_from_bytes_with_entry(
     const uint8_t *elf_bytes,
@@ -85,7 +92,8 @@ int32_t rustld_elfloader_execute_from_bytes_with_entry(
     const char *const *envp,
     const RustLdAuxvItem *auxv,
     size_t auxv_len,
-    int32_t verbose
+    int32_t verbose,
+    int32_t indirect_syscalls
 );
 
 #ifdef __cplusplus

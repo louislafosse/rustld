@@ -23,34 +23,31 @@ gcc -O2 -I./include -o ./target/release/examples/rustld_c ./examples/rustld_c.c 
 
 ## Run from the SDK
 ```rs
-
-// In Rust :
+// In Rust:
 // See exact implementation in ./examples/rustld.rs
-rustld::ElfLoader::execute_from_bytes(
-    target_bytes,
-    target_argv,      // Vec<String>, argv[0] = target path
-    None,             // env override (None => parent env)
-    None,             // auxv override (None => parent auxv)
-    false,
-);
 
-// Optional explicit entrypoint (shared object symbol or address)
-rustld::ElfLoader::execute_from_bytes_with_entry(
-    target_bytes,
-    target_argv,
-    Some("hello"),    // or None
-    None,             // or Some(0x399)
-    None,
-    None,
-    false,
+// With syscall trampoline obfuscation:
+rustld::ElfLoader::new_with_obf(true).execute_from_bytes(target_bytes, target_argv, None, None, false);
+
+// Without obfuscation:
+rustld::ElfLoader::new().execute_from_bytes(target_bytes, target_argv, None, None, false);
+
+// Optional explicit entrypoint:
+rustld::ElfLoader::new_with_obf(true).execute_from_bytes_with_entry(
+    target_bytes, target_argv,
+    Some("hello"), // or None
+    None,          // or Some(0x399)
+    None, None, false,
 );
 ```
 
 ```c
-// In C :
+// In C:
 // See exact implementation in ./examples/rustld_c.c
 #include "rustld.h"
 
+// Last argument: 1 = indirect trampoline syscalls
+//                0 = direct inline syscalls
 int32_t rc = rustld_elfloader_execute_from_bytes(
     target_bytes,           // mapped ELF bytes
     target_len,             // ELF size
@@ -59,7 +56,8 @@ int32_t rc = rustld_elfloader_execute_from_bytes(
     NULL,                   // envp override (NULL => parent env)
     NULL,                   // auxv override (NULL => parent auxv)
     0,                      // auxv_len
-    0                       // verbose
+    0,                      // verbose
+    1                       // indirect_syscalls (1 = trampoline, 0 = direct)
 );
 
 // Optional explicit entrypoint override
@@ -68,13 +66,14 @@ int32_t rc2 = rustld_elfloader_execute_from_bytes_with_entry(
     target_len,
     target_argc,
     target_argv,
-    "hello",               // entry symbol (or NULL)
-    0x399,                  // entry address
+    "hello",               // entry_symbol (or NULL)
+    0x399,                  // entry_address
     0,                      // entry_address_is_set (set 1 to use address)
     NULL,
     NULL,
     0,
-    0
+    0,
+    1                       // indirect_syscalls
 );
 ```
 
@@ -121,6 +120,9 @@ qemu-aarch64 -L "$ROOT" "$RUSTLD" ./tests/hello_arm64_glibc
 # Works with hello_arm64_glibc_static, hello_arm64_musl, hello_arm64_musl_static
 qemu-aarch64 -L "$ROOT" "$RUSTLD" "$ROOT/usr/bin/curl" --version
 ```
+
+## Known Limitations
+- Loading `/usr/bin/fish` through `rustld` is currently unstable in PTY mode and can abort after startup when typing commands.
 
 References:  
 https://github.com/bminor/glibc/blob/master/elf/rtld.c  

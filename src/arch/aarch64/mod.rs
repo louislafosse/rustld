@@ -2,48 +2,26 @@ use core::{
     arch::asm,
     ffi::{c_char, c_void},
 };
+use crate::syscall::trampoline::indirect_syscall6;
 
 #[inline(always)]
 unsafe fn syscall0(number: usize) -> isize {
-    let rc: isize;
-    asm!(
-        "svc 0",
-        in("x8") number,
-        lateout("x0") rc,
-        options(nostack),
-    );
-    rc
+    unsafe { indirect_syscall6(number, 0, 0, 0, 0, 0, 0) }
+}
+
+#[inline(always)]
+unsafe fn syscall1(number: usize, arg0: usize) -> isize {
+    unsafe { indirect_syscall6(number, arg0, 0, 0, 0, 0, 0) }
 }
 
 #[inline(always)]
 unsafe fn syscall3(number: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
-    let rc: isize;
-    asm!(
-        "svc 0",
-        in("x8") number,
-        in("x0") arg0,
-        in("x1") arg1,
-        in("x2") arg2,
-        lateout("x0") rc,
-        options(nostack),
-    );
-    rc
+    unsafe { indirect_syscall6(number, arg0, arg1, arg2, 0, 0, 0) }
 }
 
 #[inline(always)]
 unsafe fn syscall4(number: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> isize {
-    let rc: isize;
-    asm!(
-        "svc 0",
-        in("x8") number,
-        in("x0") arg0,
-        in("x1") arg1,
-        in("x2") arg2,
-        in("x3") arg3,
-        lateout("x0") rc,
-        options(nostack),
-    );
-    rc
+    unsafe { indirect_syscall6(number, arg0, arg1, arg2, arg3, 0, 0) }
 }
 
 #[inline(always)]
@@ -92,18 +70,7 @@ pub(crate) fn close(fd: i32) -> isize {
     unsafe { syscall1(CLOSE, fd as isize as usize) }
 }
 
-#[inline(always)]
-unsafe fn syscall1(number: usize, arg0: usize) -> isize {
-    let rc: isize;
-    asm!(
-        "svc 0",
-        in("x8") number,
-        in("x0") arg0,
-        lateout("x0") rc,
-        options(nostack),
-    );
-    rc
-}
+
 
 #[inline(always)]
 pub(crate) unsafe fn execve(
@@ -260,10 +227,10 @@ pub unsafe extern "C" fn __rustld_tlsdesc_resolver(desc: *const usize) -> usize 
 
 #[inline(always)]
 pub(crate) fn tlsdesc_resolver_addr() -> usize {
-    __rustld_tlsdesc_resolver as usize
+    __rustld_tlsdesc_resolver as *const () as usize
 }
 
 #[inline(always)]
 pub(crate) fn tlsdesc_return_addr() -> usize {
-    __rustld_tlsdesc_return as usize
+    __rustld_tlsdesc_return as *const () as usize
 }

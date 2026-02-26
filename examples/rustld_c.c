@@ -64,6 +64,8 @@ int main(int argc, char **argv) {
 
     /*
      * envp = NULL and auxv = NULL => reuse parent environment and auxv.
+     * indirect_syscalls = 1 => route syscalls through anonymous RX trampoline
+     * (syscall opcode hidden from the loader image).
      * On success this does not return.
      */
     int32_t rc = rustld_elfloader_execute_from_bytes(
@@ -74,7 +76,8 @@ int main(int argc, char **argv) {
         NULL,
         NULL,
         0,
-        0
+        0,
+        1   /* indirect_syscalls: trampoline mode */
     );
 
     fprintf(stderr, "rustld_c: execute_from_bytes failed (code=%d)\n", (int)rc);

@@ -42,9 +42,35 @@ struct RuntimeMetadata {
 ///
 /// `ElfLoader` prepares an ELF image, reconstructs the target startup context
 /// (stack/auxv/env), and transfers control to the loaded entry point.
-pub struct ElfLoader;
+pub struct ElfLoader {
+    /// When `true`, all syscalls are issued through an anonymous RX trampoline
+    /// page built at runtime.  The syscall opcode (`syscall` / `0x0F 0x05` on
+    /// x86_64, `svc #0` / `0xD4000001` on aarch64) never appears in the
+    /// loader's ELF image — making it invisible to static scans and shifting
+    /// the PC seen by `strace`/`ptrace` into an anonymous mapping rather than
+    /// a named ELF segment.
+    ///
+    /// Supported on x86_64 and aarch64. No-op on other targets.
+    /// Use [`ElfLoader::new_with_obf`] to enable.
+    pub indirect_syscalls: bool,
+}
 
 impl ElfLoader {
+    /// Create an `ElfLoader` with direct inline syscalls (no obfuscation).
+    pub fn new() -> Self {
+        Self {
+            indirect_syscalls: false,
+        }
+    }
+
+    /// Create an `ElfLoader` with explicit syscall mode.
+    ///
+    /// Pass `true` to enable the anonymous RX trampoline (recommended for
+    /// anti-RE builds). Pass `false` for conventional direct syscalls.
+    pub fn new_with_obf(indirect_syscalls: bool) -> Self {
+        Self { indirect_syscalls }
+    }
+
     #[inline(always)]
     fn validate_entry_override(entry_symbol: Option<&str>, entry_address: Option<usize>) {
         if entry_symbol.is_some() && entry_address.is_some() {
@@ -79,13 +105,14 @@ impl ElfLoader {
     /// This performs raw pointer based loader setup internally.
     #[inline(always)]
     pub unsafe fn prepare_from_bytes(
+        &self,
         elf_bytes: &[u8],
         target_argv: Vec<String>,
         env_pointer: Option<*const *const u8>,
         auxv_template: Option<&[AuxiliaryVectorItem]>,
         verbose: bool,
     ) -> JumpInfo {
-        Self::prepare_from_bytes_with_entry(
+        self.prepare_from_bytes_with_entry(
             elf_bytes,
             target_argv,
             None,
@@ -106,6 +133,7 @@ impl ElfLoader {
     /// Passing both is rejected.
     #[inline(always)]
     pub unsafe fn prepare_from_bytes_with_entry(
+        &self,
         elf_bytes: &[u8],
         target_argv: Vec<String>,
         entry_symbol: Option<&str>,
@@ -166,6 +194,11 @@ impl ElfLoader {
         let metadata = derive_runtime_metadata(auxv_template);
         page_size::set_page_size(metadata.page_size);
 
+        // Apply the indirect-syscall setting before any loading work touches
+        // the syscall layer.  No-op on other targets.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        crate::syscall::set_use_indirect(self.indirect_syscalls);
+
         start::execute_elf_from_bytes(
             elf_bytes,
             target_argc,
@@ -201,13 +234,14 @@ impl ElfLoader {
     ///
     #[inline(always)]
     pub unsafe fn execute_from_bytes(
+        &self,
         elf_bytes: &[u8],
         target_argv: Vec<String>,
         env_pointer: Option<*const *const u8>,
         auxv_template: Option<&[AuxiliaryVectorItem]>,
         verbose: bool,
     ) -> ! {
-        Self::execute_from_bytes_with_entry(
+        self.execute_from_bytes_with_entry(
             elf_bytes,
             target_argv,
             None,
@@ -228,6 +262,7 @@ impl ElfLoader {
     /// Passing both is rejected.
     #[inline(always)]
     pub unsafe fn execute_from_bytes_with_entry(
+        &self,
         elf_bytes: &[u8],
         target_argv: Vec<String>,
         entry_symbol: Option<&str>,
@@ -244,7 +279,7 @@ impl ElfLoader {
             None
         };
 
-        let jump = Self::prepare_from_bytes_with_entry(
+        let jump = self.prepare_from_bytes_with_entry(
             elf_bytes,
             target_argv,
             entry_symbol,

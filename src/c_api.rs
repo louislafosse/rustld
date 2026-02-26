@@ -67,8 +67,12 @@ pub unsafe extern "C" fn rustld_host_environment_pointer() -> *mut *mut c_char {
 
 /// C ABI wrapper over `ElfLoader::prepare_from_bytes`.
 ///
-/// If `envp` is null, parent environment is reused.
-/// If `auxv` is null or `auxv_len == 0`, parent auxv is reused.
+/// Does not jump; returns `RustLdJumpInfo` entry/stack for a later handoff.
+/// - `envp == NULL`: reuse parent environment.
+/// - `auxv == NULL` / `auxv_len == 0`: reuse parent auxv.
+/// - `indirect_syscalls != 0`: route all syscalls through an anonymous RX
+///   trampoline page so the syscall opcode never appears in the loader image
+///   (x86_64: `0x0F 0x05`, aarch64: `0xD4000001`). Pass 0 for direct syscalls.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustld_elfloader_prepare_from_bytes(
     elf_bytes: *const u8,
@@ -79,6 +83,7 @@ pub unsafe extern "C" fn rustld_elfloader_prepare_from_bytes(
     auxv: *const RustLdAuxvItem,
     auxv_len: usize,
     verbose: i32,
+    indirect_syscalls: i32,
     out_jump: *mut RustLdJumpInfo,
 ) -> i32 {
     if elf_bytes.is_null() || elf_len == 0 || out_jump.is_null() {
@@ -96,8 +101,11 @@ pub unsafe extern "C" fn rustld_elfloader_prepare_from_bytes(
             Some(envp as *const *const u8)
         };
 
+        let loader = ElfLoader {
+            indirect_syscalls: indirect_syscalls != 0,
+        };
         let jump =
-            ElfLoader::prepare_from_bytes(bytes, args, env_override, auxv_override, verbose != 0);
+            loader.prepare_from_bytes(bytes, args, env_override, auxv_override, verbose != 0);
 
         (*out_jump).entry = jump.entry;
         (*out_jump).stack = jump.stack;
@@ -113,7 +121,9 @@ pub unsafe extern "C" fn rustld_elfloader_prepare_from_bytes(
 
 /// C ABI wrapper over `ElfLoader::execute_from_bytes`.
 ///
-/// Returns only on error. On success, control jumps to target entrypoint.
+/// Returns only on error; on success transfers control to target entrypoint.
+/// - `indirect_syscalls != 0`: trampoline mode — syscall opcode hidden from
+///   image (x86_64: `0x0F 0x05`, aarch64: `0xD4000001`). Pass 0 for direct.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes(
     elf_bytes: *const u8,
@@ -124,6 +134,7 @@ pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes(
     auxv: *const RustLdAuxvItem,
     auxv_len: usize,
     verbose: i32,
+    indirect_syscalls: i32,
 ) -> i32 {
     if elf_bytes.is_null() || elf_len == 0 {
         return RUSTLD_EINVAL;
@@ -141,8 +152,11 @@ pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes(
     } else {
         Some(envp as *const *const u8)
     };
+    let loader = ElfLoader {
+        indirect_syscalls: indirect_syscalls != 0,
+    };
     let result = std::panic::catch_unwind(|| unsafe {
-        ElfLoader::execute_from_bytes(bytes, args, env_override, auxv_override, verbose != 0);
+        loader.execute_from_bytes(bytes, args, env_override, auxv_override, verbose != 0);
     });
 
     match result {
@@ -153,8 +167,10 @@ pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes(
 
 /// C ABI wrapper over `ElfLoader::execute_from_bytes_with_entry`.
 ///
-/// Pass either `entry_symbol` (non-null) or set `entry_address_is_set != 0`.
-/// Returns only on error. On success, control jumps to selected entrypoint.
+/// Pass either `entry_symbol` (non-null) or `entry_address_is_set != 0`, not both.
+/// Returns only on error; on success transfers control to selected entrypoint.
+/// - `indirect_syscalls != 0`: trampoline mode — syscall opcode hidden from
+///   image (x86_64: `0x0F 0x05`, aarch64: `0xD4000001`). Pass 0 for direct.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes_with_entry(
     elf_bytes: *const u8,
@@ -168,6 +184,7 @@ pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes_with_entry(
     auxv: *const RustLdAuxvItem,
     auxv_len: usize,
     verbose: i32,
+    indirect_syscalls: i32,
 ) -> i32 {
     if elf_bytes.is_null() || elf_len == 0 {
         return RUSTLD_EINVAL;
@@ -204,7 +221,10 @@ pub unsafe extern "C" fn rustld_elfloader_execute_from_bytes_with_entry(
     }
 
     let result = std::panic::catch_unwind(|| unsafe {
-        ElfLoader::execute_from_bytes_with_entry(
+        let loader = ElfLoader {
+            indirect_syscalls: indirect_syscalls != 0,
+        };
+        loader.execute_from_bytes_with_entry(
             bytes,
             args,
             symbol_override,
