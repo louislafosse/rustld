@@ -121,7 +121,7 @@ qemu-aarch64 -L "$ROOT" "$RUSTLD" ./tests/hello_arm64_glibc
 qemu-aarch64 -L "$ROOT" "$RUSTLD" "$ROOT/usr/bin/curl" --version
 
 # If you want to run all the test suite in one command
-AARCH64_ROOT=/tmp/aarch64-root ./tests/test_suite.sh
+RUSTLD_X86=./target/release/examples/rustld AARCH64_ROOT=/tmp/aarch64-root ./tests/test_suite.sh
 ```
 
 ## Known Limitations
