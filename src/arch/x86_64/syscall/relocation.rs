@@ -44,6 +44,7 @@ fn get_stub_symbol(name: &str) -> Option<usize> {
         "_dl_rtld_di_serinfo" => || _dl_rtld_di_serinfo as *const () as usize,
         "__tunable_is_initialized" => || __tunable_is_initialized as *const () as usize,
         "__tunable_get_val" => || __tunable_get_val as *const () as usize,
+        "__nptl_change_stack_perm" => || __nptl_change_stack_perm as *const () as usize,
         "__tls_get_addr" => || __tls_get_addr as *const () as usize,
         "dlopen" => || dlopen as *const () as usize,
         "dlsym" => || dlsym as *const () as usize,
@@ -71,7 +72,8 @@ fn is_stub_preferred(name: &str) -> bool {
         || name.starts_with("__tunable_")
         || matches!(
             name,
-            "__tls_get_addr"
+            "__nptl_change_stack_perm"
+                | "__tls_get_addr"
                 | "dlsym"
                 | "dlvsym"
                 | "dlopen"
@@ -249,6 +251,14 @@ fn get_stub_symbol_any(symbol_name: &str) -> Option<usize> {
 #[inline(always)]
 fn symbol_binding(symbol: Symbol) -> u8 {
     symbol.st_info >> 4
+}
+
+#[inline(always)]
+fn should_keep_weak_init_fini_undef(symbol: Symbol, symbol_name: &str) -> bool {
+    if symbol.st_shndx != SHN_UNDEF || symbol_binding(symbol) != STB_WEAK {
+        return false;
+    }
+    matches!(symbol_without_version(symbol_name), "_init" | "_fini")
 }
 
 #[cold]
@@ -510,6 +520,10 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                if should_keep_weak_init_fini_undef(symbol, symbol_name) {
+                    core::ptr::write(relocate_address as *mut usize, rela.r_addend as usize);
+                    continue;
+                }
                 let base_symbol_name = symbol_without_version(symbol_name);
                 let prefer_stub = is_stub_preferred(base_symbol_name);
 
@@ -587,6 +601,10 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                if should_keep_weak_init_fini_undef(symbol, symbol_name) {
+                    core::ptr::write(relocate_address as *mut usize, 0);
+                    continue;
+                }
 
                 let base_symbol_name = symbol_without_version(symbol_name);
                 let prefer_stub = is_stub_preferred(base_symbol_name);

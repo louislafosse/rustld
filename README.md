@@ -119,6 +119,9 @@ export QEMU_LD_PREFIX="$ROOT"
 qemu-aarch64 -L "$ROOT" "$RUSTLD" ./tests/hello_arm64_glibc
 # Works with hello_arm64_glibc_static, hello_arm64_musl, hello_arm64_musl_static
 qemu-aarch64 -L "$ROOT" "$RUSTLD" "$ROOT/usr/bin/curl" --version
+
+# If you want to run all the test suite in one command
+AARCH64_ROOT=/tmp/aarch64-root ./tests/test_suite.sh
 ```
 
 ## Known Limitations

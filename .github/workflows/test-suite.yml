@@ -1,0 +1,77 @@
+name: Test Suite
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Host Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            build-essential \
+            ca-certificates \
+            debootstrap \
+            musl-tools \
+            qemu-user \
+            qemu-user-static
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2026-02-23
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo Artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prepare AArch64 Rootfs
+        run: |
+          sudo rm -rf /tmp/aarch64-root
+          sudo /usr/sbin/qemu-debootstrap \
+            --arch=arm64 \
+            --variant=minbase \
+            --include=ca-certificates,coreutils,curl,python3,libstdc++6,zlib1g,libssl3,musl \
+            bookworm \
+            /tmp/aarch64-root \
+            http://deb.debian.org/debian
+
+      - name: Build rustld (x86_64 + aarch64)
+        run: |
+          chmod +x tests/build_tests.sh tests/test_suite.sh
+          cargo build --example rustld
+          cargo build --release --example rustld
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+            cargo build --release --target aarch64-unknown-linux-gnu --example rustld
+
+      - name: Build Test Binaries
+        run: ./tests/build_tests.sh
+
+      - name: Run Test Suite
+        env:
+          AARCH64_ROOT: /tmp/aarch64-root
+          RUSTLD_X86: ./target/debug/examples/rustld
+        run: ./tests/test_suite.sh
+
+      - name: Upload Test Suite Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-suite-logs
+          path: /tmp/rustld_test_suite
+          if-no-files-found: ignore

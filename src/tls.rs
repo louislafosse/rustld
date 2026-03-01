@@ -25,6 +25,39 @@ const GLIBC_RSEQ_AREA_OFFSET: isize = -192;
 #[cfg(target_arch = "x86_64")]
 const GLIBC_RSEQ_AREA_SIZE: usize = 32;
 
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_SELF_OFFSET: usize = 0x00;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_DTV_OFFSET: usize = 0x08;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_PREV_OFFSET: usize = 0x10;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_NEXT_OFFSET: usize = 0x18;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_SYSINFO_OFFSET: usize = 0x20;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_CANARY_OFFSET: usize = 0x28;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_TID_OFFSET: usize = 0x30;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_DETACH_STATE_OFFSET: usize = 0x38;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_ROBUST_HEAD_OFFSET: usize = 0x88;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_ROBUST_OFF_OFFSET: usize = 0x90;
+#[cfg(target_arch = "x86_64")]
+const MUSL_PTHREAD_ROBUST_PENDING_OFFSET: usize = 0x98;
+
+#[cfg(target_arch = "x86_64")]
+const MUSL_DETACH_STATE_JOINABLE: i32 = 2;
+
+#[cfg(target_arch = "aarch64")]
+const MUSL_AARCH64_PTHREAD_SIZE_BEFORE_TP: usize = 0xC8;
+#[cfg(target_arch = "aarch64")]
+const MUSL_AARCH64_DTV_SLOT_FROM_TP: isize = -8;
+#[cfg(target_arch = "aarch64")]
+const MUSL_AARCH64_SELF_OFFSET: usize = 0x00;
+
 pub struct TlsState {
     pub tcb: *mut ThreadControlBlock,
     pub dtv: *mut usize,
@@ -150,6 +183,45 @@ unsafe fn set_dtv_capacity(dtv: *mut DtvEntry, capacity: usize) {
     (*dtv.sub(1)).to_free = 0;
 }
 
+#[inline(always)]
+unsafe fn tcb_read_dtv_ptr(tcb: *mut ThreadControlBlock) -> *mut usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if tcb.is_null() {
+            core::ptr::null_mut()
+        } else {
+            core::ptr::read(tcb.cast::<usize>()) as *mut usize
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if tcb.is_null() {
+            core::ptr::null_mut()
+        } else {
+            (*tcb).dtv
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn tcb_write_dtv_ptr(tcb: *mut ThreadControlBlock, dtv: *mut usize) {
+    if tcb.is_null() {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // aarch64 glibc uses DTV-at-TP: first word at TP is the DTV pointer.
+        // Keep TP+8 deterministic (glibc private slot).
+        let head = tcb.cast::<usize>();
+        core::ptr::write(head, dtv as usize);
+        core::ptr::write(head.add(1), 0);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        (*tcb).dtv = dtv;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct TlsLayout {
     pub tcb_offset: usize,
@@ -161,10 +233,16 @@ pub struct TlsLayout {
 }
 
 pub unsafe fn prepare_tls_layout(objects: &mut [SharedObject]) {
-    // Reserve a small fixed window below TP so glibc's rseq scratch area
-    // (TP-192..TP-160 on x86_64) does not overlap any module TLS bytes.
-    // Keep this modest (not the old large surplus) to avoid startup regressions.
+    // Reserve a fixed window below TP for runtime-private pthread/TLS state.
+    // On x86_64 a small gap covers rseq scratch (TP-192..TP-160).
+    // On aarch64 glibc touches deeper negative TP offsets during early startup;
+    // keep a larger reserve so those accesses never underflow the mapped TLS area.
+    #[cfg(target_arch = "x86_64")]
     const RSEQ_RESERVE_BYTES: usize = 256;
+    #[cfg(target_arch = "aarch64")]
+    const RSEQ_RESERVE_BYTES: usize = 4096;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    const RSEQ_RESERVE_BYTES: usize = 1024;
     const RUNTIME_STATIC_SURPLUS_BYTES: usize = 0;
     let mut module_id = 1usize;
     let mut max_align = align_of::<ThreadControlBlock>();
@@ -378,6 +456,7 @@ pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [
         __glibc_reserved2: 0,
         _padding: [0; 2048],
     };
+    tcb_write_dtv_ptr(tcb, dtv.cast::<usize>());
 
     // glibc keeps an internal per-thread key-block pointer at tp-0x28.
     // Keep it NULL for the initial thread; child-thread setup may copy
@@ -401,6 +480,100 @@ pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [
         runtime_static_cursor: layout.runtime_static_start,
         modules,
     });
+}
+
+pub unsafe fn install_tls_musl(objects: &[SharedObject], pseudorandom_bytes: *const [u8; 16]) {
+    install_tls(objects, pseudorandom_bytes);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[allow(static_mut_refs)]
+        let Some(state) = TLS_STATE.as_ref() else {
+            return;
+        };
+        if state.tcb.is_null() || state.dtv.is_null() {
+            return;
+        }
+
+        let pthread = state.tcb as *mut u8;
+        let self_ptr = state.tcb as usize;
+        let dtv_ptr = state.dtv as usize;
+
+        // musl expects struct pthread at TP (FS:0 on x86_64).
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_SELF_OFFSET) as *mut usize,
+            self_ptr,
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_DTV_OFFSET) as *mut usize,
+            dtv_ptr,
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_PREV_OFFSET) as *mut usize,
+            self_ptr,
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_NEXT_OFFSET) as *mut usize,
+            self_ptr,
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_SYSINFO_OFFSET) as *mut usize,
+            0usize,
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_CANARY_OFFSET) as *mut usize,
+            (*state.tcb).stack_guard,
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_TID_OFFSET) as *mut i32,
+            current_tid(),
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_DETACH_STATE_OFFSET) as *mut i32,
+            MUSL_DETACH_STATE_JOINABLE,
+        );
+
+        let robust_head = pthread.add(MUSL_PTHREAD_ROBUST_HEAD_OFFSET) as usize;
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_ROBUST_HEAD_OFFSET) as *mut usize,
+            robust_head,
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_ROBUST_OFF_OFFSET) as *mut isize,
+            0,
+        );
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_PTHREAD_ROBUST_PENDING_OFFSET) as *mut usize,
+            0,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(static_mut_refs)]
+        let Some(state) = TLS_STATE.as_ref() else {
+            return;
+        };
+        if state.tcb.is_null() || state.dtv.is_null() {
+            return;
+        }
+
+        // musl/aarch64 uses TP as an address 0xC8 bytes past struct pthread.
+        // Keep TP as installed by install_tls() and seed the expected words
+        // around it so pthread_self()/__tls_get_addr() see a valid layout.
+        let tp = state.tcb as *mut u8;
+        let pthread = tp.sub(MUSL_AARCH64_PTHREAD_SIZE_BEFORE_TP);
+
+        core::ptr::write_bytes(pthread, 0, MUSL_AARCH64_PTHREAD_SIZE_BEFORE_TP);
+        core::ptr::write_unaligned(
+            pthread.add(MUSL_AARCH64_SELF_OFFSET) as *mut usize,
+            pthread as usize,
+        );
+        core::ptr::write_unaligned(
+            tp.offset(MUSL_AARCH64_DTV_SLOT_FROM_TP) as *mut usize,
+            state.dtv as usize,
+        );
+    }
 }
 
 pub unsafe fn allocate_tls_for_new_thread() -> Option<*mut ThreadControlBlock> {
@@ -510,7 +683,7 @@ unsafe fn initialize_tls_block(
 
     (*tcb).tcb = tcb;
     (*tcb).self_ptr = tcb;
-    (*tcb).dtv = dtv.cast::<usize>();
+    tcb_write_dtv_ptr(tcb, dtv.cast::<usize>());
     (*tcb).multiple_threads = 1;
     (*tcb).stack_guard = (*state.tcb).stack_guard;
     (*tcb).pointer_guard = (*state.tcb).pointer_guard;
@@ -732,7 +905,7 @@ pub unsafe fn register_runtime_tls_modules(
         (*new_dtv.add(module.module_id)).to_free = 0;
     }
 
-    (*current_tcb).dtv = new_dtv.cast::<usize>();
+    tcb_write_dtv_ptr(current_tcb, new_dtv.cast::<usize>());
     if state.tcb == current_tcb {
         state.tcb = current_tcb;
     }
@@ -749,7 +922,7 @@ pub unsafe fn register_runtime_tls_modules(
             continue;
         }
 
-        let mut dtv = (*tcb).dtv as *mut DtvEntry;
+        let mut dtv = tcb_read_dtv_ptr(tcb) as *mut DtvEntry;
         if dtv.is_null() {
             continue;
         }
@@ -780,7 +953,7 @@ pub unsafe fn register_runtime_tls_modules(
             (*expanded_dtv).value = (*dtv).value.wrapping_add(1);
             (*expanded_dtv).to_free = 0;
             dtv = expanded_dtv;
-            (*tcb).dtv = dtv.cast::<usize>();
+            tcb_write_dtv_ptr(tcb, dtv.cast::<usize>());
             capacity = new_dtv_len;
         }
 
@@ -826,7 +999,7 @@ pub unsafe fn finalize_runtime_tls_images(objects: &[SharedObject]) -> Result<()
             continue;
         }
 
-        let dtv = (*tcb).dtv as *mut DtvEntry;
+        let dtv = tcb_read_dtv_ptr(tcb) as *mut DtvEntry;
         if dtv.is_null() {
             continue;
         }
@@ -906,7 +1079,7 @@ pub unsafe fn resolve_tls_address(module: usize, offset: usize) -> Option<usize>
     if current_tcb.is_null() {
         return None;
     }
-    let mut dtv = (*current_tcb).dtv as *mut DtvEntry;
+    let mut dtv = tcb_read_dtv_ptr(current_tcb) as *mut DtvEntry;
     if dtv.is_null() {
         return None;
     }
@@ -948,7 +1121,7 @@ pub unsafe fn resolve_tls_address(module: usize, offset: usize) -> Option<usize>
             (*new_dtv).to_free = 0;
             dtv = new_dtv;
             current_len = new_len;
-            (*current_tcb).dtv = dtv.cast::<usize>();
+            tcb_write_dtv_ptr(current_tcb, dtv.cast::<usize>());
             if state.tcb == current_tcb {
                 state.dtv = dtv.cast::<usize>();
             }

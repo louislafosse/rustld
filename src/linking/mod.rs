@@ -74,6 +74,28 @@ const DEFAULT_LIBRARY_PATHS: &[&str] = &[
     "/usr/local/lib",
 ];
 
+#[cfg(target_arch = "x86_64")]
+const RTLD_RO_LOOKUP_SYMBOL_X_OFFSET: usize = 0x340;
+#[cfg(target_arch = "x86_64")]
+const RTLD_RO_DLOPEN_OFFSET: usize = 0x348;
+#[cfg(target_arch = "x86_64")]
+const RTLD_RO_DLCLOSE_OFFSET: usize = 0x350;
+#[cfg(target_arch = "x86_64")]
+const RTLD_RO_CATCH_ERROR_OFFSET: usize = 0x358;
+#[cfg(target_arch = "x86_64")]
+const RTLD_RO_ERROR_FREE_OFFSET: usize = 0x360;
+
+#[cfg(target_arch = "aarch64")]
+const RTLD_RO_LOOKUP_SYMBOL_X_OFFSET: usize = 0x128;
+#[cfg(target_arch = "aarch64")]
+const RTLD_RO_DLOPEN_OFFSET: usize = 0x130;
+#[cfg(target_arch = "aarch64")]
+const RTLD_RO_DLCLOSE_OFFSET: usize = 0x138;
+#[cfg(target_arch = "aarch64")]
+const RTLD_RO_CATCH_ERROR_OFFSET: usize = 0x140;
+#[cfg(target_arch = "aarch64")]
+const RTLD_RO_ERROR_FREE_OFFSET: usize = 0x148;
+
 static mut ACTIVE_LINKER: *mut DynamicLinker = core::ptr::null_mut();
 static CONFIGURED_LIBRARY_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 static LD_LIBRARY_PATH: OnceLock<Option<String>> = OnceLock::new();
@@ -168,12 +190,18 @@ fn link_map_info_index(tag: usize) -> Option<usize> {
 }
 
 unsafe fn populate_link_map_dynamic_info(map: *mut u8, dynamic: *const DynamicArrayItem) {
-    if dynamic.is_null() {
+    if dynamic.is_null()
+        || (dynamic as usize) % core::mem::align_of::<DynamicArrayItem>() != 0
+    {
         return;
     }
 
     let mut cursor = dynamic;
+    let mut scanned = 0usize;
     loop {
+        if scanned >= 4096 {
+            break;
+        }
         let item = *cursor;
         if item.d_tag == crate::elf::dynamic_array::DT_NULL {
             break;
@@ -187,6 +215,7 @@ unsafe fn populate_link_map_dynamic_info(map: *mut u8, dynamic: *const DynamicAr
             }
         }
         cursor = cursor.add(1);
+        scanned = scanned.saturating_add(1);
     }
 }
 
@@ -342,16 +371,17 @@ impl RtldStubs {
         *(rtld_global_ro.byte_add(0x310) as *mut usize) = hwcap2;
         // glibc sysconf(_SC_MINSIGSTKSZ/_SC_SIGSTKSZ) asserts this is non-zero.
         *(rtld_global_ro.byte_add(0x20) as *mut usize) = minsigstacksize.max(2048);
-        // libc dispatches dlopen/dlsym helpers through function pointers here.
-        *(rtld_global_ro.byte_add(0x340) as *mut usize) =
+        // libc dispatches dlfcn helpers through callback slots in
+        // _rtld_global_ro. Offsets are architecture-specific.
+        *(rtld_global_ro.byte_add(RTLD_RO_LOOKUP_SYMBOL_X_OFFSET) as *mut usize) =
             ld_stubs::__rustld_rtld_lookup_symbol_x_stub as *const () as usize;
-        *(rtld_global_ro.byte_add(0x348) as *mut usize) =
+        *(rtld_global_ro.byte_add(RTLD_RO_DLOPEN_OFFSET) as *mut usize) =
             ld_stubs::__rustld_rtld_dlopen_stub as *const () as usize;
-        *(rtld_global_ro.byte_add(0x350) as *mut usize) =
+        *(rtld_global_ro.byte_add(RTLD_RO_DLCLOSE_OFFSET) as *mut usize) =
             ld_stubs::__rustld_rtld_dlclose_stub as *const () as usize;
-        *(rtld_global_ro.byte_add(0x358) as *mut usize) =
+        *(rtld_global_ro.byte_add(RTLD_RO_CATCH_ERROR_OFFSET) as *mut usize) =
             ld_stubs::__rustld_rtld_catch_error as *const () as usize;
-        *(rtld_global_ro.byte_add(0x360) as *mut usize) =
+        *(rtld_global_ro.byte_add(RTLD_RO_ERROR_FREE_OFFSET) as *mut usize) =
             ld_stubs::__rustld_rtld_error_free as *const () as usize;
         // __libc_early_init reads static TLS size/alignment from these fields.
         // Keep non-zero defaults to avoid division-by-zero before TLS layout is known.
@@ -456,6 +486,36 @@ pub struct DynamicLinker {
 }
 
 impl DynamicLinker {
+    #[inline(always)]
+    fn musl_libc_fallback_candidates(name: &str) -> &'static [&'static str] {
+        if name != "libc.so" {
+            return &[];
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            return &[
+                "/lib/ld-musl-x86_64.so.1",
+                "/lib64/ld-musl-x86_64.so.1",
+                "/usr/x86_64-linux-musl/lib/ld-musl-x86_64.so.1",
+                "/usr/x86_64-linux-musl/lib64/ld-musl-x86_64.so.1",
+            ];
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            return &[
+                "/lib/ld-musl-aarch64.so.1",
+                "/lib64/ld-musl-aarch64.so.1",
+                "/usr/aarch64-linux-musl/lib/ld-musl-aarch64.so.1",
+                "/usr/aarch64-linux-musl/lib64/ld-musl-aarch64.so.1",
+            ];
+        }
+
+        #[allow(unreachable_code)]
+        &[]
+    }
+
     #[inline(always)]
     fn host_elf_machine() -> u16 {
         #[cfg(target_arch = "x86_64")]
@@ -893,11 +953,14 @@ impl DynamicLinker {
         let c_name = CString::new(name_hint).unwrap_or_else(|_| CString::new("<invalid>").unwrap());
         let raw_name = c_name.into_raw();
 
-        let previous = self
+        let mut previous = self
             .object_link_maps
             .last()
             .copied()
             .unwrap_or(core::ptr::null_mut());
+        if !previous.is_null() && (previous as usize) % core::mem::align_of::<usize>() != 0 {
+            previous = core::ptr::null_mut();
+        }
         let map = unsafe {
             mmap(
                 null_mut(),
@@ -918,15 +981,23 @@ impl DynamicLinker {
             exit::exit(1);
         }
         unsafe {
+            let dynamic_ptr = self.objects[index].dynamic as usize;
+            let dynamic_for_link_map = if dynamic_ptr == 0
+                || (dynamic_ptr % core::mem::align_of::<DynamicArrayItem>() != 0)
+            {
+                core::ptr::null()
+            } else {
+                self.objects[index].dynamic
+            };
             core::ptr::write_bytes(map, 0, LINK_MAP_SIZE);
             *(map.byte_add(LINK_MAP_L_ADDR_OFFSET) as *mut usize) = self.objects[index].base;
             *(map.byte_add(LINK_MAP_L_NAME_OFFSET) as *mut *const c_char) = raw_name;
             *(map.byte_add(LINK_MAP_L_LD_OFFSET) as *mut *const c_void) =
-                self.objects[index].dynamic as *const c_void;
+                dynamic_for_link_map as *const c_void;
             *(map.byte_add(LINK_MAP_L_NEXT_OFFSET) as *mut *mut u8) = core::ptr::null_mut();
             *(map.byte_add(LINK_MAP_L_PREV_OFFSET) as *mut *mut u8) = previous;
             *(map.byte_add(LINK_MAP_L_REAL_OFFSET) as *mut *mut u8) = map;
-            populate_link_map_dynamic_info(map, self.objects[index].dynamic);
+            populate_link_map_dynamic_info(map, dynamic_for_link_map);
 
             if !previous.is_null() {
                 *(previous.byte_add(LINK_MAP_L_NEXT_OFFSET) as *mut *mut u8) = map;
@@ -967,7 +1038,13 @@ impl DynamicLinker {
             .map(|path| path.as_str())
             .unwrap_or(name.as_str())
             .to_string();
-        self.install_link_map_for_object(index, &link_name);
+        if self.rtld_stubs.is_some() {
+            self.install_link_map_for_object(index, &link_name);
+        } else {
+            // musl-target path: runtime dl* stubs can use synthetic handles.
+            self.object_link_maps.push(core::ptr::null_mut());
+            self.object_link_map_names.push(core::ptr::null_mut());
+        }
         self.map_alias(name, index);
         if let Some(path) = object_path {
             self.map_alias(path.clone(), index);
@@ -1156,6 +1233,12 @@ impl DynamicLinker {
                 return Some(found);
             }
         }
+
+        for fallback in Self::musl_libc_fallback_candidates(name) {
+            if let Some(fd) = Self::open_path(fallback) {
+                return Some(((*fallback).to_string(), fd));
+            }
+        }
         None
     }
 
@@ -1308,7 +1391,12 @@ impl DynamicLinker {
 
         self.rebuild_lookup_scopes();
 
-        tls::register_runtime_tls_modules(&mut self.objects[start_idx..])?;
+        let new_objects_have_tls = self.objects[start_idx..]
+            .iter()
+            .any(|object| object.tls.is_some());
+        if new_objects_have_tls {
+            tls::register_runtime_tls_modules(&mut self.objects[start_idx..])?;
+        }
 
         let mut ifuncs = Vec::new();
         let mut copies = Vec::new();
@@ -1333,7 +1421,9 @@ impl DynamicLinker {
         }
         relocation::apply_copy_relocations(&copies);
         relocation::apply_irelative_relocations(&ifuncs);
-        tls::finalize_runtime_tls_images(&self.objects[start_idx..])?;
+        if new_objects_have_tls {
+            tls::finalize_runtime_tls_images(&self.objects[start_idx..])?;
+        }
 
         // Run init in dependency order rooted at the object requested by
         // dlopen, mirroring glibc's behavior more closely for plugin trees.

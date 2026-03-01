@@ -91,6 +91,24 @@ const DLERROR_BUF_SIZE: usize = 256;
 static RTLD_LOCK_OWNER_TID: AtomicI32 = AtomicI32::new(0);
 static RTLD_LOCK_DEPTH: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(debug_assertions)]
+static STUB_TRACE_REMAINING: AtomicU32 = AtomicU32::new(200);
+
+#[cfg(debug_assertions)]
+#[inline(always)]
+fn debug_stub_trace(name: &str) {
+    if STUB_TRACE_REMAINING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        (v > 0).then_some(v - 1)
+    }).is_ok()
+    {
+        eprintln!("ld_stub: {}", name);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn debug_stub_trace(_name: &str) {}
+
 struct RtldOpGuard {
     tid: i32,
     locked: bool,
@@ -1299,6 +1317,7 @@ pub extern "C" fn selabel_lookup_best_match_raw(
 
 #[no_mangle]
 pub extern "C" fn _dl_find_dso_for_object(addr: *const ()) -> *const () {
+    debug_stub_trace("_dl_find_dso_for_object");
     if addr.is_null() {
         return core::ptr::null();
     }
@@ -1429,6 +1448,7 @@ pub extern "C" fn __rustld_debug_addr_object_map_end(addr: usize) -> usize {
 
 #[no_mangle]
 pub extern "C" fn _dl_allocate_tls(_mem: *mut ()) -> *mut () {
+    debug_stub_trace("_dl_allocate_tls");
     // Allocate TLS/TCB for a new thread.
     // This is required for glibc pthread startup paths that expect a non-null DTV.
     unsafe {
@@ -1458,20 +1478,25 @@ pub extern "C" fn _dl_allocate_tls(_mem: *mut ()) -> *mut () {
 
 #[no_mangle]
 pub extern "C" fn _dl_allocate_tls_init(tcb: *mut (), _main_thread: usize) -> *mut () {
+    debug_stub_trace("_dl_allocate_tls_init");
     // glibc may call this on a descriptor that was already initialized by
     // _dl_allocate_tls(). Keep this idempotent and avoid clobbering fields
     // that libc/pthread populated between the two calls.
-    #[repr(C)]
-    struct TcbHead {
-        _tcb: *mut ThreadControlBlock,
-        dtv: *mut usize,
-    }
-
     unsafe {
         __rustld_last_alloc_tls_init_arg = tcb;
         if !tcb.is_null() {
-            let head = tcb as *mut TcbHead;
-            let already_initialized = !(*head).dtv.is_null();
+            #[cfg(target_arch = "aarch64")]
+            let already_initialized = core::ptr::read(tcb.cast::<usize>()) != 0;
+            #[cfg(not(target_arch = "aarch64"))]
+            let already_initialized = {
+                #[repr(C)]
+                struct TcbHead {
+                    _tcb: *mut ThreadControlBlock,
+                    dtv: *mut usize,
+                }
+                let head = tcb as *mut TcbHead;
+                !(*head).dtv.is_null()
+            };
             if !already_initialized {
                 if let Some(initialized) = tls::initialize_tls_for_thread_ptr(tcb) {
                     let current_tp = get_thread_pointer() as *mut ThreadControlBlock;
@@ -1502,6 +1527,7 @@ pub extern "C" fn _dl_allocate_tls_init(tcb: *mut (), _main_thread: usize) -> *m
 
 #[no_mangle]
 pub extern "C" fn _dl_deallocate_tls(_tcb: *mut (), _dealloc_tcb: usize) {
+    debug_stub_trace("_dl_deallocate_tls");
     tls::unregister_thread_tcb(_tcb as *mut ThreadControlBlock);
 }
 
@@ -1526,6 +1552,7 @@ pub extern "C" fn _dl_signal_error(
     _objname: *const c_char,
     _errstring: *const c_char,
 ) {
+    debug_stub_trace("_dl_signal_error");
     let tid = current_tid();
     let frame_ptr = unsafe { catch_error_get_top(tid) };
     if frame_ptr.is_null() {
@@ -1535,13 +1562,13 @@ pub extern "C" fn _dl_signal_error(
         let frame = &mut *frame_ptr;
         frame.errcode = _errcode;
         if !frame.objname.is_null() {
-            *frame.objname = _objname;
+            core::ptr::write_unaligned(frame.objname, _objname);
         }
         if !frame.errstring.is_null() {
-            *frame.errstring = _errstring;
+            core::ptr::write_unaligned(frame.errstring, _errstring);
         }
         if !frame.mallocedp.is_null() {
-            *frame.mallocedp = 0;
+            core::ptr::write_unaligned(frame.mallocedp, 0);
         }
         // Avoid keeping rtld lock held across non-local jump.
         force_unlock_rtld_ops_if_owned_by_current_thread();
@@ -1551,6 +1578,7 @@ pub extern "C" fn _dl_signal_error(
 
 #[no_mangle]
 pub extern "C" fn _dl_signal_exception(_errcode: i32, _exception: *const ()) {
+    debug_stub_trace("_dl_signal_exception");
     static MSG: &[u8] = b"rustld: rtld exception\0";
     _dl_signal_error(_errcode, core::ptr::null(), MSG.as_ptr().cast::<c_char>());
 }
@@ -1561,6 +1589,7 @@ pub extern "C" fn _dl_catch_exception(
     operate: *const (),
     args: *const (),
 ) -> i32 {
+    debug_stub_trace("_dl_catch_exception");
     let exception = _exception as *mut DlException;
     if !exception.is_null() {
         unsafe {
@@ -1620,6 +1649,7 @@ pub extern "C" fn _dl_catch_error(
     operate: *const (),
     args: *const (),
 ) -> i32 {
+    debug_stub_trace("_dl_catch_error");
     __rustld_rtld_catch_error(
         objname,
         errstring,
@@ -1642,6 +1672,7 @@ pub extern "C" fn __rustld_rtld_lookup_symbol_x_stub(
     _flags: i32,
     skip_map_raw: usize,
 ) -> *mut c_void {
+    debug_stub_trace("__rustld_rtld_lookup_symbol_x_stub");
     clear_dlerror();
     let undef_name = undef_name_raw as *const u8;
     let reference = reference_raw as *mut *const c_void;
@@ -1662,6 +1693,7 @@ pub extern "C" fn __rustld_rtld_dlopen_stub(
     _argv: usize,
     _envp: usize,
 ) -> *mut c_void {
+    debug_stub_trace("__rustld_rtld_dlopen_stub");
     clear_dlerror();
     let file = file_raw as *const u8;
     let dispatch =
@@ -1671,6 +1703,7 @@ pub extern "C" fn __rustld_rtld_dlopen_stub(
 
 /// rtld_global_ro + 0x350: internal dlclose entry point used by libc wrappers.
 pub extern "C" fn __rustld_rtld_dlclose_stub(_map: *mut c_void) -> i32 {
+    debug_stub_trace("__rustld_rtld_dlclose_stub");
     let entry = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(__rustld_dlclose_entry)) };
     unsafe { entry(_map) }
 }
@@ -1683,14 +1716,15 @@ pub extern "C" fn __rustld_rtld_catch_error(
     operate: *const c_void,
     args: *mut c_void,
 ) -> i32 {
+    debug_stub_trace("__rustld_rtld_catch_error");
     if !objname.is_null() {
-        unsafe { *objname = core::ptr::null() };
+        unsafe { core::ptr::write_unaligned(objname, core::ptr::null()) };
     }
     if !errstring.is_null() {
-        unsafe { *errstring = core::ptr::null() };
+        unsafe { core::ptr::write_unaligned(errstring, core::ptr::null()) };
     }
     if !mallocedp.is_null() {
-        unsafe { *mallocedp = 0 };
+        unsafe { core::ptr::write_unaligned(mallocedp, 0) };
     }
 
     let mut frame = CatchErrorFrame {
@@ -1755,62 +1789,103 @@ pub extern "C" fn _dl_rtld_di_serinfo() -> *const () {
 
 #[no_mangle]
 pub extern "C" fn __tunable_is_initialized(_id: usize) -> i32 {
-    if let Some(addr) = unsafe { linking::lookup_active_symbol("__tunable_is_initialized") } {
-        let self_addr = __tunable_is_initialized as *const () as usize;
-        if addr != self_addr {
-            unsafe {
-                let func: extern "C" fn(usize) -> i32 = core::mem::transmute(addr);
-                return func(_id);
+    debug_stub_trace("__tunable_is_initialized");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(addr) = unsafe { linking::lookup_active_symbol("__tunable_is_initialized") } {
+            let self_addr = __tunable_is_initialized as *const () as usize;
+            if addr != self_addr {
+                unsafe {
+                    let func: extern "C" fn(usize) -> i32 = core::mem::transmute(addr);
+                    return func(_id);
+                }
             }
         }
     }
+    // Keep tunables handling entirely in rustld. Forwarding to glibc's
+    // internal implementation requires rtld state parity that rustld does not
+    // guarantee yet (can stall during startup on aarch64).
     0
 }
 
 #[no_mangle]
 pub extern "C" fn __tunable_get_val(_id: usize, valp: *mut (), callback: *const ()) {
-    if let Some(addr) = unsafe { linking::lookup_active_symbol("__tunable_get_val") } {
-        let self_addr = __tunable_get_val as *const () as usize;
-        if addr != self_addr {
-            unsafe {
-                let func: extern "C" fn(usize, *mut (), *const ()) = core::mem::transmute(addr);
-                func(_id, valp, callback);
-                return;
-            }
-        }
-    }
+    debug_stub_trace("__tunable_get_val");
     if valp.is_null() {
         return;
     }
 
-    unsafe {
-        match _id {
-            // int32-like startup tunables observed via gdb.
-            2 | 11 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 24 | 32 | 35 | 38 | 40 => {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(addr) = unsafe { linking::lookup_active_symbol("__tunable_get_val") } {
+            let self_addr = __tunable_get_val as *const () as usize;
+            if addr != self_addr {
+                unsafe {
+                    let func: extern "C" fn(usize, *mut (), *const ()) = core::mem::transmute(addr);
+                    func(_id, valp, callback);
+                    return;
+                }
+            }
+        }
+
+        if !callback.is_null() {
+            #[repr(C)]
+            union TunableVal {
+                numval: u64,
+                raw: [usize; 2],
+            }
+
+            unsafe {
+                // glibc callback expects pointer to tunable value payload.
+                let mut payload = TunableVal { numval: 0 };
+                let cb: extern "C" fn(*mut ()) = core::mem::transmute(callback);
+                cb((&mut payload as *mut TunableVal).cast::<()>());
+            }
+        } else {
+            // Conservative ABI-safe fallback:
+            // writing more than 32 bits to valp is not safe across glibc builds
+            // because tunable id -> storage width is internal and varies.
+            unsafe {
                 core::ptr::write_unaligned(valp.cast::<i32>(), 0);
             }
-            // uint64-like startup tunables.
-            4 | 10 => {
-                core::ptr::write_unaligned(valp.cast::<u64>(), 0);
-            }
-            // size_t-like startup tunables.
-            3 | 5 | 6 | 7 | 8 | 9 | 41 | 42 => {
-                core::ptr::write_unaligned(valp.cast::<usize>(), 0);
-            }
-            _ => {}
         }
+        return;
     }
 
-    if !callback.is_null() {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // aarch64 fallback: keep tunables handling entirely in rustld.
+        // Forwarding to glibc internals requires deeper rtld state parity.
         unsafe {
-            let cb: extern "C" fn(*mut ()) = core::mem::transmute(callback);
-            cb(valp);
+            if callback.is_null() {
+                // Scalar path: return deterministic zero.
+                core::ptr::write_unaligned(valp.cast::<i32>(), 0);
+            } else {
+                // Callback path: glibc expects a tunable value payload.
+                // Keep this conservative to avoid clobbering caller stack locals.
+                core::ptr::write_bytes(valp.cast::<u8>(), 0, size_of::<usize>());
+            }
+        }
+
+        if !callback.is_null() {
+            unsafe {
+                let cb: extern "C" fn(*mut ()) = core::mem::transmute(callback);
+                cb(valp);
+            }
         }
     }
 }
 
 #[no_mangle]
+pub extern "C" fn __nptl_change_stack_perm(_thread: *mut ()) -> i32 {
+    // Ubuntu/Debian glibc may bind this GLIBC_PRIVATE symbol from libc to ld.so.
+    // rustld does not expose full NPTL internals, so keep a conservative success stub.
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn __tls_get_addr(_ti: *const ()) -> *mut () {
+    debug_stub_trace("__tls_get_addr");
     if _ti.is_null() {
         return core::ptr::null_mut();
     }
@@ -1818,5 +1893,15 @@ pub extern "C" fn __tls_get_addr(_ti: *const ()) -> *mut () {
     let ti = _ti as *const TlsIndex;
     let module = unsafe { (*ti).ti_module };
     let offset = unsafe { (*ti).ti_offset };
-    unsafe { tls::resolve_tls_address(module, offset).unwrap_or(0) as *mut () }
+    let resolved = unsafe { tls::resolve_tls_address(module, offset).unwrap_or(0) };
+
+    #[cfg(debug_assertions)]
+    {
+        eprintln!(
+            "ld_stub: __tls_get_addr module={} offset=0x{:x} -> 0x{:x}",
+            module, offset, resolved
+        );
+    }
+
+    resolved as *mut ()
 }

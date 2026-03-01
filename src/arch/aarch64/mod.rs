@@ -1,5 +1,5 @@
 use core::{
-    arch::asm,
+    arch::{asm, global_asm},
     ffi::{c_char, c_void},
 };
 use crate::syscall::trampoline::indirect_syscall6;
@@ -105,25 +105,24 @@ pub(crate) fn running_under_valgrind() -> bool {
 }
 
 #[inline(always)]
-pub(crate) unsafe fn jump_to_entry(entry: usize, stack: usize, rtld_fini: usize) -> ! {
+pub(crate) unsafe fn jump_to_entry(entry: usize, stack: usize, _rtld_fini: usize) -> ! {
     if stack != 0 {
         asm!(
             "mov sp, x1",
-            // glibc aarch64 _start reads argc/argv from stack and expects
-            // rtld_fini in x0 from the dynamic loader.
-            "mov x0, x2",
+            // Use a neutral loader-fini argument on aarch64 handoff.
+            // glibc tolerates NULL here, and musl startup paths are stricter
+            // about unexpected loader ABI register state.
+            "mov x0, xzr",
             "br x3",
             in("x1") stack,
-            in("x2") rtld_fini,
             in("x3") entry,
             options(noreturn),
         );
     }
 
     asm!(
-        "mov x0, x2",
+        "mov x0, xzr",
         "br x3",
-        in("x2") rtld_fini,
         in("x3") entry,
         options(noreturn),
     );
@@ -191,38 +190,68 @@ pub(crate) unsafe fn memcmp(left: *const u8, right: *const u8, len: usize) -> i3
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn __rustld_tlsdesc_return(desc: *const usize) -> usize {
-    if desc.is_null() {
-        return 0;
-    }
-    core::ptr::read(desc.add(1))
-}
-
 unsafe extern "C" {
     fn __tls_get_addr(module_and_offset: *const ()) -> *mut c_void;
 }
 
-#[inline(always)]
-unsafe fn read_thread_pointer() -> usize {
-    let tp: usize;
-    asm!(
-        "mrs {}, tpidr_el0",
-        out(reg) tp,
-        options(nomem, nostack, preserves_flags),
-    );
-    tp
-}
+global_asm!(
+    r#"
+.global __rustld_tlsdesc_return
+.type __rustld_tlsdesc_return, %function
+__rustld_tlsdesc_return:
+    sub sp, sp, #96
+    stp x1, x2, [sp, #0]
+    stp x3, x4, [sp, #16]
+    stp x5, x6, [sp, #32]
+    stp x7, x8, [sp, #48]
+    stp x9, x10, [sp, #64]
+    cbz x0, 1f
+    ldr x0, [x0, #8]
+    b 2f
+1:
+    mov x0, xzr
+2:
+    ldp x9, x10, [sp, #64]
+    ldp x7, x8, [sp, #48]
+    ldp x5, x6, [sp, #32]
+    ldp x3, x4, [sp, #16]
+    ldp x1, x2, [sp, #0]
+    add sp, sp, #96
+    ret
 
-#[no_mangle]
-pub unsafe extern "C" fn __rustld_tlsdesc_resolver(desc: *const usize) -> usize {
-    if desc.is_null() {
-        return 0;
-    }
-    let module_and_offset = core::ptr::read(desc.add(1)) as *const ();
-    let addr = __tls_get_addr(module_and_offset) as usize;
-    let tp = read_thread_pointer();
-    addr.wrapping_sub(tp)
+.global __rustld_tlsdesc_resolver
+.type __rustld_tlsdesc_resolver, %function
+__rustld_tlsdesc_resolver:
+    sub sp, sp, #112
+    stp x1, x2, [sp, #0]
+    stp x3, x4, [sp, #16]
+    stp x5, x6, [sp, #32]
+    stp x7, x8, [sp, #48]
+    stp x9, x10, [sp, #64]
+    str x30, [sp, #80]
+    cbz x0, 3f
+    ldr x0, [x0, #8]
+    bl __tls_get_addr
+    mrs x10, tpidr_el0
+    sub x0, x0, x10
+    b 4f
+3:
+    mov x0, xzr
+4:
+    ldr x30, [sp, #80]
+    ldp x9, x10, [sp, #64]
+    ldp x7, x8, [sp, #48]
+    ldp x5, x6, [sp, #32]
+    ldp x3, x4, [sp, #16]
+    ldp x1, x2, [sp, #0]
+    add sp, sp, #112
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn __rustld_tlsdesc_return(desc: *const usize) -> usize;
+    fn __rustld_tlsdesc_resolver(desc: *const usize) -> usize;
 }
 
 #[inline(always)]

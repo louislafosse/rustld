@@ -43,6 +43,7 @@ fn get_stub_symbol(name: &str) -> Option<usize> {
         "_dl_rtld_di_serinfo" => || _dl_rtld_di_serinfo as *const () as usize,
         "__tunable_is_initialized" => || __tunable_is_initialized as *const () as usize,
         "__tunable_get_val" => || __tunable_get_val as *const () as usize,
+        "__nptl_change_stack_perm" => || __nptl_change_stack_perm as *const () as usize,
         "__tls_get_addr" => || __tls_get_addr as *const () as usize,
         "dlopen" => || dlopen as *const () as usize,
         "dlsym" => || dlsym as *const () as usize,
@@ -222,23 +223,41 @@ fn get_stub_symbol_any(symbol_name: &str) -> Option<usize> {
 
 #[inline(always)]
 fn prefer_stub_first(symbol_name: &str) -> bool {
-    matches!(
-        symbol_without_version(symbol_name),
-        "__tls_get_addr"
-            | "dlsym"
-            | "dlvsym"
-            | "dlopen"
-            | "dlclose"
-            | "dlerror"
-            | "dladdr"
-            | "dladdr1"
-            | "dl_iterate_phdr"
-    ) || symbol_without_version(symbol_name).starts_with("_dl_")
+    let name = symbol_without_version(symbol_name);
+    name.starts_with("_dl_")
+        || name.starts_with("__tunable_")
+        || matches!(
+            name,
+            "__nptl_change_stack_perm"
+                | "__tls_get_addr"
+                | "dlsym"
+                | "dlvsym"
+                | "dlopen"
+                | "dlclose"
+                | "dlerror"
+                | "dladdr"
+                | "dladdr1"
+                | "dl_iterate_phdr"
+                | "is_selinux_enabled"
+                | "freecon"
+                | "getcon"
+                | "getfilecon"
+                | "lgetfilecon"
+                | "getfilecon_raw"
+        )
 }
 
 #[inline(always)]
 fn symbol_binding(symbol: Symbol) -> u8 {
     symbol.st_info >> 4
+}
+
+#[inline(always)]
+fn should_keep_weak_init_fini_undef(symbol: Symbol, symbol_name: &str) -> bool {
+    if symbol.st_shndx != SHN_UNDEF || symbol_binding(symbol) != STB_WEAK {
+        return false;
+    }
+    matches!(symbol_without_version(symbol_name), "_init" | "_fini")
 }
 
 #[cold]
@@ -412,7 +431,16 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
-                let (mut symbol_addr, symbol_type) = if prefer_stub_first(symbol_name) {
+                if should_keep_weak_init_fini_undef(symbol, symbol_name) {
+                    if rela.r_type() == R_AARCH64_ABS64 {
+                        core::ptr::write(relocate_address as *mut usize, rela.r_addend as usize);
+                    } else {
+                        core::ptr::write(relocate_address as *mut usize, 0);
+                    }
+                    continue;
+                }
+                let prefer_stub = prefer_stub_first(symbol_name);
+                let (mut symbol_addr, symbol_type) = if prefer_stub {
                     if let Some(stub_addr) = get_stub_symbol_any(symbol_name) {
                         #[cfg(debug_assertions)]
                         {
@@ -677,6 +705,14 @@ pub unsafe fn relocate_with_linker(
                             write_hex(write::STD_ERR, rela.r_addend as usize);
                             write::write_str(write::STD_ERR, " value=");
                             write_hex(write::STD_ERR, relocate_value as usize);
+                            write::write_str(write::STD_ERR, " def=");
+                            if let Some(def_path) = linker.object_path(def_idx) {
+                                write::write_str(write::STD_ERR, def_path);
+                            } else {
+                                write::write_str(write::STD_ERR, "<unknown>");
+                            }
+                            write::write_str(write::STD_ERR, " tls_off=");
+                            write_hex(write::STD_ERR, tls_offset as usize);
                             write::write_str(write::STD_ERR, "\n");
                         }
                     }
@@ -689,14 +725,28 @@ pub unsafe fn relocate_with_linker(
                     .get(symbol.st_name as usize);
                 let (def_idx, def_sym) =
                     resolve_tls_symbol(object_index, symbol, symbol_name, linker, lookup_cache);
-                let (module_id, tls_offset) = linker.objects[def_idx]
-                    .tls
-                    .as_ref()
-                    .map(|tls| (tls.module_id, tls.offset))
-                    .unwrap_or((0, 0));
+                let tls_meta = linker.objects[def_idx].tls.as_ref();
+                let (module_id, tls_offset, has_static_offset) = tls_meta
+                    .map(|tls| {
+                        (
+                            tls.module_id,
+                            tls.offset,
+                            // Static TLS modules are assigned a concrete TP-relative
+                            // offset during prepare_tls_layout(). Keep TLSDESC in the
+                            // static fast path whenever that offset is known.
+                            tls.offset != 0,
+                        )
+                    })
+                    .unwrap_or((0, 0, false));
                 let dtpoff = def_sym.st_value.wrapping_add_signed(rela.r_addend);
                 let desc = relocate_address as *mut usize;
-                if module_id != 0 {
+                if has_static_offset {
+                    let tprel = tls_offset
+                        .wrapping_add(def_sym.st_value as isize)
+                        .wrapping_add(rela.r_addend);
+                    core::ptr::write(desc, crate::arch::tlsdesc_return_addr());
+                    core::ptr::write(desc.add(1), tprel as usize);
+                } else if module_id != 0 {
                     let ti = std::boxed::Box::new(crate::ld_stubs::TlsIndex {
                         ti_module: module_id,
                         ti_offset: dtpoff,
