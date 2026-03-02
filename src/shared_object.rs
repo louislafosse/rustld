@@ -376,6 +376,29 @@ impl SharedObject {
         None
     }
 
+    #[cold]
+    unsafe fn lookup_exported_symbol_linear_any_version(&self, symbol_name: &str) -> Option<Symbol> {
+        if self.symbol_table.as_ptr().is_null() || self.symbol_count == 0 {
+            return None;
+        }
+        let requested = symbol_name.as_bytes();
+
+        for sym_idx in 0..self.symbol_count {
+            let symbol = self.symbol_table.get_ref(sym_idx);
+            if !Self::symbol_is_exported(symbol) {
+                continue;
+            }
+            let name = self.string_table.get_bytes(symbol.st_name as usize);
+            if name.is_empty() {
+                continue;
+            }
+            if Self::symbol_name_matches_bytes(name, requested) {
+                return Some(*symbol);
+            }
+        }
+        None
+    }
+
     #[inline(always)]
     unsafe fn lookup_exported_symbol_indexed(&self, symbol_name: &str) -> Option<Symbol> {
         if self.sysv_export_buckets.is_empty() || symbol_name.is_empty() {
@@ -414,17 +437,20 @@ impl SharedObject {
             if let Some(symbol) = self.lookup_exported_symbol_gnu(symbol_name) {
                 return Some(symbol);
             }
-            if !self.sysv_hash.is_null() {
-                return self.lookup_exported_symbol_sysv(symbol_name);
-            }
-            return None;
         }
 
         if !self.sysv_hash.is_null() {
-            return self.lookup_exported_symbol_sysv(symbol_name);
+            if let Some(symbol) = self.lookup_exported_symbol_sysv(symbol_name) {
+                return Some(symbol);
+            }
         }
 
-        self.lookup_exported_symbol_linear(symbol_name)
+        if let Some(symbol) = self.lookup_exported_symbol_linear(symbol_name) {
+            return Some(symbol);
+        }
+
+        // Fallback for DSOs that only provide non-default-version exports
+        self.lookup_exported_symbol_linear_any_version(symbol_name)
     }
 
     unsafe fn gnu_hash_symbol_count(gnu_hash: *const u32) -> Option<usize> {

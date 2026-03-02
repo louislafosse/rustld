@@ -33,6 +33,7 @@ use std::{
     ffi::{CStr, CString},
     fs,
     mem::{size_of, MaybeUninit},
+    path::Path,
     ptr::{null, null_mut},
     slice,
 };
@@ -145,6 +146,7 @@ unsafe fn launch_target_with_source(
 ) -> JumpInfo {
     let target_path = *target_argv;
     let target_path_string = cstr_ptr_to_string(target_path);
+    setup_jpackage_layout_compat(target_path_string.as_deref());
 
     let image = match source {
         TargetImageSource::Path => load_target_image(target_path),
@@ -2276,6 +2278,77 @@ fn cstr_ptr_to_string(ptr: *const u8) -> Option<String> {
         .to_string_lossy()
         .into_owned();
     Some(text)
+}
+
+fn setup_jpackage_layout_compat(target_exec_path: Option<&str>) {
+    let Some(target_exec_path) = target_exec_path else {
+        return;
+    };
+
+    let Ok(self_exe) = fs::read_link("/proc/self/exe") else {
+        return;
+    };
+    let Some(self_name) = self_exe.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(self_bin_dir) = self_exe.parent() else {
+        return;
+    };
+
+    let target_exec = Path::new(target_exec_path);
+    let Some(target_name) = target_exec.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(target_bin_dir) = target_exec.parent() else {
+        return;
+    };
+
+    let Some(self_root_dir) = self_bin_dir.parent() else {
+        return;
+    };
+    let Some(target_root_dir) = target_bin_dir.parent() else {
+        return;
+    };
+    let self_lib_dir = self_root_dir.join("lib");
+    let target_lib_dir = target_root_dir.join("lib");
+    if self_lib_dir == target_lib_dir {
+        return;
+    }
+
+    let target_cfg = target_lib_dir.join("app").join(format!("{}.cfg", target_name));
+    if !target_cfg.exists() {
+        return;
+    }
+
+    for leaf in ["runtime", "app"] {
+        let src = target_lib_dir.join(leaf);
+        let dst = self_lib_dir.join(leaf);
+        if !src.exists() || dst.exists() {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&src, &dst);
+        }
+    }
+
+    let self_cfg = self_lib_dir.join("app").join(format!("{}.cfg", self_name));
+    if self_cfg.exists() {
+        return;
+    }
+    if let Some(parent) = self_cfg.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        if std::os::unix::fs::symlink(&target_cfg, &self_cfg).is_ok() {
+            return;
+        }
+    }
+    let _ = fs::copy(target_cfg, self_cfg);
 }
 
 #[inline(always)]

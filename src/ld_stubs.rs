@@ -97,9 +97,15 @@ static STUB_TRACE_REMAINING: AtomicU32 = AtomicU32::new(200);
 #[cfg(debug_assertions)]
 #[inline(always)]
 fn debug_stub_trace(name: &str) {
-    if STUB_TRACE_REMAINING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        (v > 0).then_some(v - 1)
-    }).is_ok()
+    if STUB_TRACE_REMAINING
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            if v > 0 {
+                Some(v - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
     {
         eprintln!("ld_stub: {}", name);
     }
@@ -479,7 +485,7 @@ pub extern "C" fn dlopen(file: *const u8, mode: i32) -> *mut c_void {
 #[inline(never)]
 pub unsafe extern "C" fn __rustld_dlclose_entry_impl(_handle: *mut c_void) -> i32 {
     clear_dlerror();
-    1
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -1479,46 +1485,30 @@ pub extern "C" fn _dl_allocate_tls(_mem: *mut ()) -> *mut () {
 #[no_mangle]
 pub extern "C" fn _dl_allocate_tls_init(tcb: *mut (), _main_thread: usize) -> *mut () {
     debug_stub_trace("_dl_allocate_tls_init");
-    // glibc may call this on a descriptor that was already initialized by
-    // _dl_allocate_tls(). Keep this idempotent and avoid clobbering fields
-    // that libc/pthread populated between the two calls.
+    // Always (re)initialize the thread descriptor TLS view.
     unsafe {
         __rustld_last_alloc_tls_init_arg = tcb;
+        let current_tp = get_thread_pointer();
+        // glibc may call this for the current thread descriptor during startup/
+        // teardown bookkeeping. For current-thread calls, only reinitialize
+        // when the descriptor's DTV/static TLS view is clearly stale.
         if !tcb.is_null() {
-            #[cfg(target_arch = "aarch64")]
-            let already_initialized = core::ptr::read(tcb.cast::<usize>()) != 0;
-            #[cfg(not(target_arch = "aarch64"))]
-            let already_initialized = {
-                #[repr(C)]
-                struct TcbHead {
-                    _tcb: *mut ThreadControlBlock,
-                    dtv: *mut usize,
-                }
-                let head = tcb as *mut TcbHead;
-                !(*head).dtv.is_null()
+            let needs_reinit = if tcb == current_tp {
+                tls::thread_ptr_needs_tls_init(tcb)
+            } else {
+                true
             };
-            if !already_initialized {
+            if needs_reinit {
                 if let Some(initialized) = tls::initialize_tls_for_thread_ptr(tcb) {
-                    let current_tp = get_thread_pointer() as *mut ThreadControlBlock;
-                    if !current_tp.is_null() && current_tp == initialized {
+                    let current_tp_tcb = current_tp as *mut ThreadControlBlock;
+                    if !current_tp_tcb.is_null() && current_tp_tcb == initialized {
                         tls::stamp_thread_tid(initialized);
                     }
                     let result = initialized.cast();
                     __rustld_last_alloc_tls_init_ret = result;
                     return result;
                 }
-            } else {
-                let current_tp = get_thread_pointer() as *mut ThreadControlBlock;
-                if !current_tp.is_null() && core::ptr::eq(current_tp.cast::<()>(), tcb) {
-                    tls::stamp_thread_tid(current_tp);
-                }
-                __rustld_last_alloc_tls_init_ret = tcb;
-                return tcb;
             }
-        }
-        let current_tp = get_thread_pointer();
-        if !current_tp.is_null() && current_tp == tcb {
-            tls::stamp_thread_tid(current_tp.cast());
         }
         __rustld_last_alloc_tls_init_ret = tcb;
     }
@@ -1894,14 +1884,6 @@ pub extern "C" fn __tls_get_addr(_ti: *const ()) -> *mut () {
     let module = unsafe { (*ti).ti_module };
     let offset = unsafe { (*ti).ti_offset };
     let resolved = unsafe { tls::resolve_tls_address(module, offset).unwrap_or(0) };
-
-    #[cfg(debug_assertions)]
-    {
-        eprintln!(
-            "ld_stub: __tls_get_addr module={} offset=0x{:x} -> 0x{:x}",
-            module, offset, resolved
-        );
-    }
 
     resolved as *mut ()
 }

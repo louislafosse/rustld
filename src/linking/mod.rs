@@ -1128,6 +1128,55 @@ impl DynamicLinker {
         Path::new(path).parent().and_then(|parent| parent.to_str())
     }
 
+    fn resolve_absolute_runtime_dlopen_fallback(&self, requested: &str) -> Option<(String, i32)> {
+        let requested_path = Path::new(requested);
+        if !requested_path.is_absolute() {
+            return None;
+        }
+
+        // Runtime launchers (for example jpackage-style binaries) often derive
+        // "<self>/../lib/<launcher>.so" from /proc/self/exe. In rustld
+        // in-process mode, /proc/self/exe is still rustld, so retry relative
+        // to the mapped target executable directory when that shape fails.
+        let requested_parent = requested_path.parent()?;
+        let requested_dir = requested_parent.file_name()?.to_str()?;
+        if requested_dir != "lib" && requested_dir != "lib64" {
+            return None;
+        }
+
+        let soname = requested_path.file_name()?.to_str()?;
+        let executable_path = self.object_path(0)?;
+        let executable_dir = Path::new(executable_path).parent()?;
+        let candidate_dirs = [
+            executable_dir.join("lib"),
+            executable_dir.join("lib64"),
+            executable_dir.join("..").join("lib"),
+            executable_dir.join("..").join("lib64"),
+        ];
+
+        for dir in candidate_dirs {
+            let candidate = dir.join(soname);
+            let Some(candidate_str) = candidate.to_str() else {
+                continue;
+            };
+            if let Some(fd) = Self::open_path(candidate_str) {
+                #[cfg(debug_assertions)]
+                {
+                    use crate::libc::fs::write;
+                    unsafe {
+                        write::write_str(write::STD_ERR, "loader: dlopen path fallback ");
+                        write::write_str(write::STD_ERR, requested);
+                        write::write_str(write::STD_ERR, " -> ");
+                        write::write_str(write::STD_ERR, candidate_str);
+                        write::write_str(write::STD_ERR, "\n");
+                    }
+                }
+                return Some((Self::normalize_existing_path(candidate_str), fd));
+            }
+        }
+        None
+    }
+
     fn expand_origin_token<'a>(path: &'a str, origin: Option<&str>) -> Option<Cow<'a, str>> {
         if !path.contains("$ORIGIN") && !path.contains("${ORIGIN}") {
             return Some(Cow::Borrowed(path));
@@ -1191,7 +1240,10 @@ impl DynamicLinker {
         requester_idx: Option<usize>,
     ) -> Option<(String, i32)> {
         if name.contains('/') {
-            return Self::open_path(name).map(|fd| (Self::normalize_existing_path(name), fd));
+            if let Some(fd) = Self::open_path(name) {
+                return Some((Self::normalize_existing_path(name), fd));
+            }
+            return self.resolve_absolute_runtime_dlopen_fallback(name);
         }
 
         let origin = requester_idx.and_then(|idx| self.object_origin_dir(idx));
@@ -1219,6 +1271,19 @@ impl DynamicLinker {
         if let Some(runpath_value) = runpath {
             if let Some(found) = self.try_open_from_search_list(runpath_value, origin, name) {
                 return Some(found);
+            }
+        }
+
+        if let Some(origin_dir) = origin {
+            if let Some(found) = Self::open_joined_path(origin_dir, name) {
+                return Some(found);
+            }
+        }
+        if let Some(main_origin) = self.object_origin_dir(0) {
+            if origin != Some(main_origin) {
+                if let Some(found) = Self::open_joined_path(main_origin, name) {
+                    return Some(found);
+                }
             }
         }
 
@@ -1302,9 +1367,29 @@ impl DynamicLinker {
             return Ok(usize::MAX);
         }
 
-        let (path, fd) = self
-            .resolve_library_path_with_fd(name, requester_idx)
-            .ok_or("library not found")?;
+        let (path, fd) = match self.resolve_library_path_with_fd(name, requester_idx) {
+            Some(found) => found,
+            None => {
+                #[cfg(debug_assertions)]
+                {
+                    use crate::libc::fs::write;
+                    write::write_str(write::STD_ERR, "loader: resolve failed name=");
+                    write::write_str(write::STD_ERR, name);
+                    write::write_str(write::STD_ERR, " requester=");
+                    if let Some(idx) = requester_idx {
+                        if let Some(path) = self.object_path(idx) {
+                            write::write_str(write::STD_ERR, path);
+                        } else {
+                            write::write_str(write::STD_ERR, "<none>");
+                        }
+                    } else {
+                        write::write_str(write::STD_ERR, "<root>");
+                    }
+                    write::write_str(write::STD_ERR, "\n");
+                }
+                return Err("library not found");
+            }
+        };
         if let Some(idx) = self.loaded_index(&path) {
             Self::close_fd(fd);
             #[cfg(debug_assertions)]

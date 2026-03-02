@@ -1,7 +1,7 @@
 use core::{
     mem::{align_of, size_of},
     ptr::null_mut,
-    sync::atomic::{AtomicI32, Ordering},
+    sync::atomic::{AtomicI32, AtomicU32, Ordering},
 };
 
 use crate::{
@@ -90,10 +90,68 @@ struct TlsModuleTemplate {
 
 static mut TLS_STATE: Option<TlsState> = None;
 static mut TLS_LAYOUT: Option<TlsLayout> = None;
+static TLS_STATE_LOCK_OWNER_TID: AtomicI32 = AtomicI32::new(0);
+static TLS_STATE_LOCK_DEPTH: AtomicU32 = AtomicU32::new(0);
 const MAX_TRACKED_THREADS: usize = 4096;
 static THREAD_TRACK_LOCK: AtomicI32 = AtomicI32::new(0);
 static mut TRACKED_THREADS: [*mut ThreadControlBlock; MAX_TRACKED_THREADS] =
     [null_mut(); MAX_TRACKED_THREADS];
+
+struct TlsStateGuard {
+    tid: i32,
+    locked: bool,
+}
+
+impl Drop for TlsStateGuard {
+    fn drop(&mut self) {
+        if !self.locked || self.tid <= 0 {
+            return;
+        }
+
+        if TLS_STATE_LOCK_OWNER_TID.load(Ordering::Acquire) != self.tid {
+            return;
+        }
+
+        let depth = TLS_STATE_LOCK_DEPTH.load(Ordering::Acquire);
+        if depth <= 1 {
+            TLS_STATE_LOCK_DEPTH.store(0, Ordering::Release);
+            TLS_STATE_LOCK_OWNER_TID.store(0, Ordering::Release);
+        } else {
+            TLS_STATE_LOCK_DEPTH.store(depth - 1, Ordering::Release);
+        }
+    }
+}
+
+#[inline(always)]
+fn lock_tls_state() -> TlsStateGuard {
+    let tid = crate::arch::gettid();
+    if tid <= 0 {
+        return TlsStateGuard {
+            tid: 0,
+            locked: false,
+        };
+    }
+
+    loop {
+        let owner = TLS_STATE_LOCK_OWNER_TID.load(Ordering::Acquire);
+        let depth = TLS_STATE_LOCK_DEPTH.load(Ordering::Acquire);
+        if owner == tid {
+            TLS_STATE_LOCK_DEPTH.store(depth.saturating_add(1), Ordering::Release);
+            return TlsStateGuard { tid, locked: true };
+        }
+
+        if owner == 0
+            && TLS_STATE_LOCK_OWNER_TID
+                .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            TLS_STATE_LOCK_DEPTH.store(1, Ordering::Release);
+            return TlsStateGuard { tid, locked: true };
+        }
+
+        core::hint::spin_loop();
+    }
+}
 
 #[inline(always)]
 fn lock_thread_registry() {
@@ -152,17 +210,93 @@ pub fn unregister_thread_tcb(tcb: *mut ThreadControlBlock) {
 
 fn tracked_threads_snapshot() -> Vec<*mut ThreadControlBlock> {
     let mut threads = Vec::new();
+    let (current_tcb, current_tid) = unsafe {
+        (
+            get_thread_pointer() as *mut ThreadControlBlock,
+            current_tid(),
+        )
+    };
     lock_thread_registry();
     unsafe {
         for idx in 0..MAX_TRACKED_THREADS {
             let tcb = TRACKED_THREADS[idx];
-            if !tcb.is_null() {
-                threads.push(tcb);
+            if tcb.is_null() {
+                continue;
             }
+            if !is_thread_descriptor_live(tcb, current_tcb, current_tid) {
+                TRACKED_THREADS[idx] = null_mut();
+                continue;
+            }
+            threads.push(tcb);
         }
     }
     unlock_thread_registry();
     threads
+}
+
+#[inline(always)]
+fn thread_exists(tid: i32) -> bool {
+    if tid <= 0 {
+        return false;
+    }
+    let rc = crate::arch::tgkill(crate::arch::getpid(), tid, 0);
+    rc == 0 || rc != -3
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn thread_tid_from_tcb(tcb: *mut ThreadControlBlock) -> i32 {
+    if tcb.is_null() {
+        return -1;
+    }
+    let base = tcb as *mut u8;
+    let glibc_tid = core::ptr::read_volatile(base.add(GLIBC_PTHREAD_TID_OFFSET) as *const i32);
+    if glibc_tid > 0 {
+        return glibc_tid;
+    }
+    let musl_tid = core::ptr::read_unaligned(base.add(MUSL_PTHREAD_TID_OFFSET) as *const i32);
+    if musl_tid > 0 {
+        musl_tid
+    } else {
+        -1
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn thread_tid_from_tcb(_tcb: *mut ThreadControlBlock) -> i32 {
+    -1
+}
+
+#[inline(always)]
+unsafe fn is_thread_descriptor_live(
+    tcb: *mut ThreadControlBlock,
+    current_tcb: *mut ThreadControlBlock,
+    current_tid: i32,
+) -> bool {
+    if tcb.is_null() {
+        return false;
+    }
+    if tcb == current_tcb {
+        return true;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let tid = thread_tid_from_tcb(tcb);
+        if tid <= 0 {
+            return false;
+        }
+        if tid == current_tid {
+            return true;
+        }
+        return thread_exists(tid);
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
+    }
 }
 
 #[inline]
@@ -233,6 +367,7 @@ pub struct TlsLayout {
 }
 
 pub unsafe fn prepare_tls_layout(objects: &mut [SharedObject]) {
+    let _guard = lock_tls_state();
     // Reserve a fixed window below TP for runtime-private pthread/TLS state.
     // On x86_64 a small gap covers rseq scratch (TP-192..TP-160).
     // On aarch64 glibc touches deeper negative TP offsets during early startup;
@@ -243,7 +378,7 @@ pub unsafe fn prepare_tls_layout(objects: &mut [SharedObject]) {
     const RSEQ_RESERVE_BYTES: usize = 4096;
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     const RSEQ_RESERVE_BYTES: usize = 1024;
-    const RUNTIME_STATIC_SURPLUS_BYTES: usize = 0;
+    const RUNTIME_STATIC_SURPLUS_BYTES: usize = 64 * 1024;
     let mut module_id = 1usize;
     let mut max_align = align_of::<ThreadControlBlock>();
 
@@ -334,6 +469,7 @@ pub unsafe fn prepare_tls_layout(objects: &mut [SharedObject]) {
 }
 
 pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [u8; 16]) {
+    let _guard = lock_tls_state();
     let layout = match TLS_LAYOUT {
         Some(layout) => layout,
         None => return,
@@ -468,6 +604,8 @@ pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [
     }
 
     set_thread_pointer(tcb.cast());
+    // The initial thread descriptor must expose a valid self-linked list for
+    // glibc fork/clone bookkeeping (used in child after fork paths).
     initialize_glibc_thread_links(tcb);
     stamp_thread_tid(tcb);
     register_thread_tcb(tcb);
@@ -483,6 +621,7 @@ pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [
 }
 
 pub unsafe fn install_tls_musl(objects: &[SharedObject], pseudorandom_bytes: *const [u8; 16]) {
+    let _guard = lock_tls_state();
     install_tls(objects, pseudorandom_bytes);
 
     #[cfg(target_arch = "x86_64")]
@@ -504,10 +643,7 @@ pub unsafe fn install_tls_musl(objects: &[SharedObject], pseudorandom_bytes: *co
             pthread.add(MUSL_PTHREAD_SELF_OFFSET) as *mut usize,
             self_ptr,
         );
-        core::ptr::write_unaligned(
-            pthread.add(MUSL_PTHREAD_DTV_OFFSET) as *mut usize,
-            dtv_ptr,
-        );
+        core::ptr::write_unaligned(pthread.add(MUSL_PTHREAD_DTV_OFFSET) as *mut usize, dtv_ptr);
         core::ptr::write_unaligned(
             pthread.add(MUSL_PTHREAD_PREV_OFFSET) as *mut usize,
             self_ptr,
@@ -538,10 +674,7 @@ pub unsafe fn install_tls_musl(objects: &[SharedObject], pseudorandom_bytes: *co
             pthread.add(MUSL_PTHREAD_ROBUST_HEAD_OFFSET) as *mut usize,
             robust_head,
         );
-        core::ptr::write_unaligned(
-            pthread.add(MUSL_PTHREAD_ROBUST_OFF_OFFSET) as *mut isize,
-            0,
-        );
+        core::ptr::write_unaligned(pthread.add(MUSL_PTHREAD_ROBUST_OFF_OFFSET) as *mut isize, 0);
         core::ptr::write_unaligned(
             pthread.add(MUSL_PTHREAD_ROBUST_PENDING_OFFSET) as *mut usize,
             0,
@@ -577,6 +710,7 @@ pub unsafe fn install_tls_musl(objects: &[SharedObject], pseudorandom_bytes: *co
 }
 
 pub unsafe fn allocate_tls_for_new_thread() -> Option<*mut ThreadControlBlock> {
+    let _guard = lock_tls_state();
     let layout = TLS_LAYOUT?;
     let total_size = layout.tcb_offset + size_of::<ThreadControlBlock>() + layout.max_align;
     let raw = mmap(
@@ -596,6 +730,7 @@ pub unsafe fn allocate_tls_for_new_thread() -> Option<*mut ThreadControlBlock> {
 pub unsafe fn initialize_tls_for_thread_ptr(
     thread_ptr: *mut (),
 ) -> Option<*mut ThreadControlBlock> {
+    let _guard = lock_tls_state();
     if thread_ptr.is_null() {
         return None;
     }
@@ -609,11 +744,56 @@ pub unsafe fn initialize_tls_for_thread_ptr(
     initialize_tls_block(tls_base, tcb, false)
 }
 
+pub unsafe fn thread_ptr_needs_tls_init(thread_ptr: *mut ()) -> bool {
+    let _guard = lock_tls_state();
+    if thread_ptr.is_null() {
+        return false;
+    }
+    let Some(layout) = TLS_LAYOUT else {
+        return false;
+    };
+    #[allow(static_mut_refs)]
+    let Some(state) = TLS_STATE.as_ref() else {
+        return false;
+    };
+    if state.dtv_len == 0 {
+        return false;
+    }
+
+    let tcb = thread_ptr as *mut ThreadControlBlock;
+    let dtv = tcb_read_dtv_ptr(tcb) as *mut DtvEntry;
+    if dtv.is_null() {
+        return true;
+    }
+    let capacity = dtv_capacity(dtv);
+    if capacity == 0 || capacity < state.dtv_len {
+        return true;
+    }
+
+    let tls_base = (tcb as *mut u8).sub(layout.tcb_offset);
+    for module in state.modules.iter() {
+        if module.dynamic {
+            continue;
+        }
+        if module.module_id >= capacity {
+            return true;
+        }
+        let expected = (tls_base as usize).wrapping_add(module.block_offset);
+        let actual = (*dtv.add(module.module_id)).value;
+        if actual != expected {
+            return true;
+        }
+    }
+
+    false
+}
+
 unsafe fn initialize_tls_block(
     tls_base: *mut u8,
     tcb: *mut ThreadControlBlock,
     clone_full_tcb: bool,
 ) -> Option<*mut ThreadControlBlock> {
+    let _guard = lock_tls_state();
     let layout = TLS_LAYOUT?;
     #[allow(static_mut_refs)]
     let state = TLS_STATE.as_ref()?;
@@ -681,14 +861,21 @@ unsafe fn initialize_tls_block(
         }
     }
 
-    (*tcb).tcb = tcb;
-    (*tcb).self_ptr = tcb;
+    if clone_full_tcb {
+        (*tcb).tcb = tcb;
+        (*tcb).self_ptr = tcb;
+        (*tcb).multiple_threads = 1;
+        (*tcb).stack_guard = (*state.tcb).stack_guard;
+        (*tcb).pointer_guard = (*state.tcb).pointer_guard;
+    }
+    // Keep this write for both paths so __tls_get_addr observes the DTV that
+    // belongs to this thread, while preserving glibc-owned thread-descriptor
+    // internals when clone_full_tcb=false.
     tcb_write_dtv_ptr(tcb, dtv.cast::<usize>());
-    (*tcb).multiple_threads = 1;
-    (*tcb).stack_guard = (*state.tcb).stack_guard;
-    (*tcb).pointer_guard = (*state.tcb).pointer_guard;
 
-    initialize_glibc_thread_links(tcb);
+    if clone_full_tcb {
+        initialize_glibc_thread_links(tcb);
+    }
 
     // glibc keeps an internal per-thread key-block pointer at tp-0x28.
     // For fresh, allocator-owned TCBs we must clear it.
@@ -722,6 +909,7 @@ pub unsafe fn tls_state() -> Option<&'static TlsState> {
 }
 
 pub unsafe fn tls_layout() -> Option<TlsLayout> {
+    let _guard = lock_tls_state();
     TLS_LAYOUT
 }
 
@@ -795,6 +983,7 @@ unsafe fn initialize_glibc_thread_links(tcb: *mut ThreadControlBlock) {
 pub unsafe fn register_runtime_tls_modules(
     objects: &mut [SharedObject],
 ) -> Result<(), &'static str> {
+    let _guard = lock_tls_state();
     #[allow(static_mut_refs)]
     let state = TLS_STATE.as_mut().ok_or("rustld: TLS state unavailable")?;
     let layout = TLS_LAYOUT.ok_or("rustld: TLS layout unavailable")?;
@@ -917,8 +1106,13 @@ pub unsafe fn register_runtime_tls_modules(
     // Propagate newly assigned static TLS blocks to other already-created
     // threads so direct TP-relative accesses (R_X86_64_TPOFF*) stay valid.
     let tracked_threads = tracked_threads_snapshot();
+    let snapshot_tid = current_tid();
     for tcb in tracked_threads {
         if tcb.is_null() || tcb == current_tcb {
+            continue;
+        }
+        if !is_thread_descriptor_live(tcb, current_tcb, snapshot_tid) {
+            unregister_thread_tcb(tcb);
             continue;
         }
 
@@ -986,6 +1180,7 @@ pub unsafe fn register_runtime_tls_modules(
 }
 
 pub unsafe fn finalize_runtime_tls_images(objects: &[SharedObject]) -> Result<(), &'static str> {
+    let _guard = lock_tls_state();
     #[allow(static_mut_refs)]
     let state = TLS_STATE.as_ref().ok_or("rustld: TLS state unavailable")?;
     let layout = TLS_LAYOUT.ok_or("rustld: TLS layout unavailable")?;
@@ -994,8 +1189,14 @@ pub unsafe fn finalize_runtime_tls_images(objects: &[SharedObject]) -> Result<()
     }
 
     let tracked_threads = tracked_threads_snapshot();
+    let current_tcb = get_thread_pointer() as *mut ThreadControlBlock;
+    let snapshot_tid = current_tid();
     for tcb in tracked_threads {
         if tcb.is_null() {
+            continue;
+        }
+        if !is_thread_descriptor_live(tcb, current_tcb, snapshot_tid) {
+            unregister_thread_tcb(tcb);
             continue;
         }
 
@@ -1065,15 +1266,13 @@ fn find_module_template<'a>(
 }
 
 pub unsafe fn resolve_tls_address(module: usize, offset: usize) -> Option<usize> {
+    let _guard = lock_tls_state();
     if module == 0 {
         return None;
     }
     #[allow(static_mut_refs)]
     let state = TLS_STATE.as_mut()?;
     let global_len = state.dtv_len;
-    if module >= global_len {
-        return None;
-    }
 
     let current_tcb = get_thread_pointer() as *mut ThreadControlBlock;
     if current_tcb.is_null() {
@@ -1089,6 +1288,45 @@ pub unsafe fn resolve_tls_address(module: usize, offset: usize) -> Option<usize>
         // Backward compatibility with previously-created tables.
         current_len = global_len;
         set_dtv_capacity(dtv, current_len);
+    }
+
+    if module >= global_len {
+        // Fallback for foreign module IDs not registered in rustld TLS state:
+        // if the current thread DTV already has a slot, use it directly.
+        if module < current_len {
+            let base = (*dtv.add(module)).value;
+            if base != 0 {
+                return Some(base.wrapping_add(offset));
+            }
+        }
+        return None;
+    }
+
+    let module_template = match find_module_template(&state.modules, module) {
+        Some(template) => template,
+        None => {
+            // Defensive fallback for layout/state skew: honor existing thread
+            // DTV content instead of forcing a null TLS result.
+            if module < current_len {
+                let base = (*dtv.add(module)).value;
+                if base != 0 {
+                    return Some(base.wrapping_add(offset));
+                }
+            }
+            return None;
+        }
+    };
+    if !module_template.dynamic {
+        // Static TLS module bases are deterministic from TP + layout.
+        // Do not trust a stale/non-owned DTV slot for these modules.
+        let layout = TLS_LAYOUT?;
+        let tls_base = (current_tcb as *mut u8).sub(layout.tcb_offset);
+        let static_base = (tls_base as usize).wrapping_add(module_template.block_offset);
+        if module < current_len {
+            (*dtv.add(module)).value = static_base;
+            (*dtv.add(module)).to_free = 0;
+        }
+        return Some(static_base.wrapping_add(offset));
     }
 
     let mut module_base = if module < current_len {
@@ -1131,13 +1369,7 @@ pub unsafe fn resolve_tls_address(module: usize, offset: usize) -> Option<usize>
             module_base = (*dtv.add(module)).value;
         }
         if module_base == 0 {
-            let module_template = find_module_template(&state.modules, module)?;
-            module_base = if module_template.dynamic {
-                allocate_tls_module_block(module_template)?
-            } else {
-                let tls_base = current_thread_tls_base()?;
-                (tls_base as usize).wrapping_add(module_template.block_offset)
-            };
+            module_base = allocate_tls_module_block(module_template)?;
             (*dtv.add(module)).value = module_base;
             (*dtv.add(module)).to_free = 0;
         }
