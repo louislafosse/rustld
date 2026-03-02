@@ -197,7 +197,7 @@ impl ElfLoader {
         // Apply the indirect-syscall setting before any loading work touches
         // the syscall layer.  No-op on other targets.
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        crate::syscall::set_use_indirect(self.indirect_syscalls);
+        crate::syscall::trampoline::set_use_indirect(self.indirect_syscalls);
 
         start::execute_elf_from_bytes(
             elf_bytes,

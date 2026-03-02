@@ -2,7 +2,7 @@
 //! You can run (almost) **everything** with it.
 //! 
 //! ## Rust SDK:
-//! ```rs
+//! ```rust
 //! // With syscall trampoline obfuscation:
 //! rustld::ElfLoader::new_with_obf(true).execute_from_bytes(target_bytes, target_argv, None, None, false);
 //! // Without obfuscation:
@@ -17,7 +17,7 @@
 //! ``` 
 //! 
 //! ## Basic usage example:
-//! ```rs
+//! ```rust
 //! use std::{ffi::OsStr, os::fd::AsRawFd, os::unix::ffi::OsStrExt};
 //! use rustld::ElfLoader;
 //! 
@@ -156,6 +156,7 @@
 //! ```
 //! 
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(c_variadic)]
 #![feature(type_changing_struct_update)]

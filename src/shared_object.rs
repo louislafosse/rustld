@@ -129,6 +129,7 @@ pub struct SharedObject {
     pub string_table_size: usize, // Size of string table (from DT_STRSZ)
     exportable_symbol_mask: Vec<usize>,
     sysv_export_buckets: Vec<SmallVec<[u32; 4]>>,
+    sysv_export_any_version_buckets: Vec<SmallVec<[u32; 4]>>,
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +191,20 @@ impl SharedObject {
         } else {
             name
         }
+    }
+
+    #[inline(always)]
+    fn should_try_non_default_version_fallback(symbol_name: &str) -> bool {
+        matches!(
+            symbol_name,
+            "__res_nsearch"
+                | "__res_nquery"
+                | "__res_nquerydomain"
+                | "__res_nsend"
+                | "__res_nmkquery"
+                | "__res_ninit"
+                | "__res_nclose"
+        )
     }
 
     #[inline(always)]
@@ -424,6 +439,33 @@ impl SharedObject {
     }
 
     #[inline(always)]
+    unsafe fn lookup_exported_symbol_indexed_any_version(&self, symbol_name: &str) -> Option<Symbol> {
+        if self.sysv_export_any_version_buckets.is_empty() || symbol_name.is_empty() {
+            return None;
+        }
+        let requested = symbol_name.as_bytes();
+
+        let hash = Self::sysv_hash(Self::symbol_base_name(symbol_name)) as usize;
+        let bucket_idx = hash % self.sysv_export_any_version_buckets.len();
+        let candidates = &self.sysv_export_any_version_buckets[bucket_idx];
+        for &sym_idx_u32 in candidates {
+            let sym_idx = sym_idx_u32 as usize;
+            if sym_idx >= self.symbol_count {
+                continue;
+            }
+            let symbol = self.symbol_table.get_ref(sym_idx);
+            if !Self::symbol_is_exported(symbol) {
+                continue;
+            }
+            let name = self.string_table.get_bytes(symbol.st_name as usize);
+            if !name.is_empty() && Self::symbol_name_matches_bytes(name, requested) {
+                return Some(*symbol);
+            }
+        }
+        None
+    }
+
+    #[inline(always)]
     pub unsafe fn lookup_exported_symbol(&self, symbol_name: &str) -> Option<Symbol> {
         if symbol_name.is_empty() {
             return None;
@@ -445,12 +487,23 @@ impl SharedObject {
             }
         }
 
-        if let Some(symbol) = self.lookup_exported_symbol_linear(symbol_name) {
-            return Some(symbol);
+        // Only pay linear-scan cost when no hash tables are available.
+        if self.gnu_hash.is_null() && self.sysv_hash.is_null() {
+            if let Some(symbol) = self.lookup_exported_symbol_linear(symbol_name) {
+                return Some(symbol);
+            }
         }
 
-        // Fallback for DSOs that only provide non-default-version exports
-        self.lookup_exported_symbol_linear_any_version(symbol_name)
+        // Keep this fallback narrow: scanning full symbol tables on every miss
+        // is expensive in relocation hot paths.
+        if Self::should_try_non_default_version_fallback(symbol_name) {
+            if let Some(symbol) = self.lookup_exported_symbol_indexed_any_version(symbol_name) {
+                return Some(symbol);
+            }
+            return self.lookup_exported_symbol_linear_any_version(symbol_name);
+        }
+
+        None
     }
 
     unsafe fn gnu_hash_symbol_count(gnu_hash: *const u32) -> Option<usize> {
@@ -911,28 +964,32 @@ impl SharedObject {
         let export_words = symbol_count.saturating_add(Self::EXPORT_MASK_WORD_BITS - 1)
             / Self::EXPORT_MASK_WORD_BITS;
         let mut exportable_symbol_mask = vec![0usize; export_words];
+        let mut exportable_any_version_mask = vec![0usize; export_words];
         if symbol_count > 0 && !symbol_table_pointer.is_null() {
             let symbol_table = SymbolTable::new(symbol_table_pointer);
             for sym_idx in 0..symbol_count {
                 let symbol = symbol_table.get_ref(sym_idx);
-                if !Self::symbol_is_exported(symbol)
-                    || !Self::symbol_version_is_exported_raw(versym_pointer, sym_idx)
-                {
+                if !Self::symbol_is_exported(symbol) {
                     continue;
                 }
                 let word_idx = sym_idx / Self::EXPORT_MASK_WORD_BITS;
                 let bit_idx = sym_idx % Self::EXPORT_MASK_WORD_BITS;
-                exportable_symbol_mask[word_idx] |= 1usize << bit_idx;
+                exportable_any_version_mask[word_idx] |= 1usize << bit_idx;
+                if Self::symbol_version_is_exported_raw(versym_pointer, sym_idx) {
+                    exportable_symbol_mask[word_idx] |= 1usize << bit_idx;
+                }
             }
         }
 
         let mut sysv_export_buckets: Vec<SmallVec<[u32; 4]>> = Vec::new();
+        let mut sysv_export_any_version_buckets: Vec<SmallVec<[u32; 4]>> = Vec::new();
         if !sysv_hash_pointer.is_null() && symbol_count > 0 {
             let table = sysv_hash_pointer;
             let nbucket = *table as usize;
             let nchain = *table.add(1) as usize;
             if nbucket > 0 && nchain > 0 {
                 sysv_export_buckets.resize_with(nbucket, SmallVec::new);
+                sysv_export_any_version_buckets.resize_with(nbucket, SmallVec::new);
                 let buckets_ptr = table.add(2);
                 let chains_ptr = buckets_ptr.add(nbucket);
                 for bucket_idx in 0..nbucket {
@@ -943,6 +1000,9 @@ impl SharedObject {
                         let bit_idx = sym_idx % Self::EXPORT_MASK_WORD_BITS;
                         if ((exportable_symbol_mask[word_idx] >> bit_idx) & 1) != 0 {
                             sysv_export_buckets[bucket_idx].push(sym_idx as u32);
+                        }
+                        if ((exportable_any_version_mask[word_idx] >> bit_idx) & 1) != 0 {
+                            sysv_export_any_version_buckets[bucket_idx].push(sym_idx as u32);
                         }
                         let next_sym_idx = *chains_ptr.add(sym_idx) as usize;
                         if next_sym_idx == sym_idx {
@@ -1011,6 +1071,7 @@ impl SharedObject {
             string_table_size,
             exportable_symbol_mask,
             sysv_export_buckets,
+            sysv_export_any_version_buckets,
         }
     }
 
@@ -1048,6 +1109,7 @@ impl SharedObject {
             string_table_size: 0,
             exportable_symbol_mask: Vec::new(),
             sysv_export_buckets: Vec::new(),
+            sysv_export_any_version_buckets: Vec::new(),
         }
     }
 

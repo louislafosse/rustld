@@ -37,6 +37,8 @@ use std::{
     ptr::{null, null_mut},
     slice,
 };
+#[cfg(all(target_arch = "x86_64", target_family = "unix"))]
+use std::os::unix::fs::MetadataExt;
 
 pub mod auxiliary_vector;
 pub mod environment_variables;
@@ -727,7 +729,9 @@ unsafe fn symbol_address_any(linker: &DynamicLinker, name: &str) -> Option<usize
 unsafe fn set_symbol_pointer_all(linker: &DynamicLinker, names: &[&str], value: usize) {
     const SHN_ABS: u16 = 0xfff1;
 
-    for object in linker.objects.iter() {
+    let candidate_indices = startup_symbol_target_indices(linker);
+    for &idx in candidate_indices.iter() {
+        let object = &linker.objects[idx];
         for &name in names {
             let Some(sym) = object.lookup_exported_symbol(name) else {
                 continue;
@@ -746,8 +750,32 @@ unsafe fn set_symbol_pointer_all(linker: &DynamicLinker, names: &[&str], value: 
 unsafe fn set_symbol_pointer_batch_all(linker: &DynamicLinker, writes: &[(&str, usize)]) {
     const SHN_ABS: u16 = 0xfff1;
 
-    for object in linker.objects.iter() {
-        for &(name, value) in writes {
+    let candidate_indices = startup_symbol_target_indices(linker);
+    for &(name, value) in writes {
+        let mut wrote_any = false;
+
+        for &idx in candidate_indices.iter() {
+            let object = &linker.objects[idx];
+            let Some(sym) = object.lookup_exported_symbol(name) else {
+                continue;
+            };
+            wrote_any = true;
+            let base = if sym.st_shndx == SHN_ABS {
+                0
+            } else {
+                object.base
+            };
+            let ptr = base.wrapping_add(sym.st_value) as *mut usize;
+            core::ptr::write_volatile(ptr, value);
+        }
+
+        if wrote_any {
+            continue;
+        }
+
+        // Rare compatibility fallback: preserve previous behavior if a target
+        // symbol is not present in the common startup-bearing DSOs.
+        for object in linker.objects.iter() {
             let Some(sym) = object.lookup_exported_symbol(name) else {
                 continue;
             };
@@ -760,6 +788,27 @@ unsafe fn set_symbol_pointer_batch_all(linker: &DynamicLinker, writes: &[(&str, 
             core::ptr::write_volatile(ptr, value);
         }
     }
+}
+
+unsafe fn startup_symbol_target_indices(linker: &DynamicLinker) -> SmallVec<[usize; 6]> {
+    let mut indices: SmallVec<[usize; 6]> = SmallVec::new();
+    if !linker.objects.is_empty() {
+        indices.push(0);
+    }
+
+    for (idx, object) in linker.objects.iter().enumerate().skip(1) {
+        let Some(soname) = object.soname_str() else {
+            continue;
+        };
+        let is_startup_dso = soname == "libc.so.6"
+            || soname.starts_with("ld-linux")
+            || soname.starts_with("ld-musl")
+            || soname.starts_with("libc.musl");
+        if is_startup_dso && !indices.contains(&idx) {
+            indices.push(idx);
+        }
+    }
+    indices
 }
 
 unsafe fn call_libc_early_init(linker: &DynamicLinker) {
@@ -907,20 +956,8 @@ unsafe fn patch_libc_copy_thresholds(linker: &DynamicLinker) {
     };
     let base = linker.get_base(idx);
 
-    if let Some(symbol_offsets) = load_libc_copy_threshold_offsets_from_symtab(libc_path) {
-        #[cfg(debug_assertions)]
-        {
-            use crate::libc::fs::write;
-            write::write_str(write::STD_ERR, "loader: libc thresholds via symtab ");
-            write::write_str(write::STD_ERR, libc_path);
-            write::write_str(write::STD_ERR, "\n");
-        }
-        apply_libc_copy_threshold_patch(base, &symbol_offsets);
-        return;
-    }
-
-    // Fallback for stripped/non-standard libc files where local symtab is
-    // unavailable: only trust known /lib64-style fixed offsets.
+    // Fast path on /lib64-style glibc layouts where offsets are known.
+    // This avoids expensive full symtab parsing on the hot startup path.
     if libc_path.ends_with("/lib64/libc.so.6") || libc_path.ends_with("/usr/lib64/libc.so.6") {
         #[cfg(debug_assertions)]
         {
@@ -948,15 +985,28 @@ unsafe fn patch_libc_copy_thresholds(linker: &DynamicLinker) {
             memset_non_temporal_ptr,
             shared_non_temporal_ptr,
         );
-    } else {
+        return;
+    }
+
+    if let Some(symbol_offsets) = load_libc_copy_threshold_offsets_from_symtab(libc_path) {
         #[cfg(debug_assertions)]
         {
             use crate::libc::fs::write;
-            write::write_str(
-                write::STD_ERR,
-                "loader: libc thresholds fixed-offset fallback disabled for this libc path\n",
-            );
+            write::write_str(write::STD_ERR, "loader: libc thresholds via symtab ");
+            write::write_str(write::STD_ERR, libc_path);
+            write::write_str(write::STD_ERR, "\n");
         }
+        apply_libc_copy_threshold_patch(base, &symbol_offsets);
+        return;
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        use crate::libc::fs::write;
+        write::write_str(
+            write::STD_ERR,
+            "loader: libc thresholds fixed-offset fallback disabled for this libc path\n",
+        );
     }
 }
 
@@ -1001,8 +1051,93 @@ struct Elf64Symbol {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn libc_thresholds_offsets_complete(
+    rep_stosb: Option<usize>,
+    rep_movsb: Option<usize>,
+    shared_cache_size: Option<usize>,
+    shared_cache_half: Option<usize>,
+    rep_movsb_stop: Option<usize>,
+    memset_non_temporal: Option<usize>,
+    shared_non_temporal: Option<usize>,
+) -> bool {
+    rep_stosb.is_some()
+        && rep_movsb.is_some()
+        && shared_cache_size.is_some()
+        && shared_cache_half.is_some()
+        && rep_movsb_stop.is_some()
+        && memset_non_temporal.is_some()
+        && shared_non_temporal.is_some()
+}
+
+#[cfg(all(target_arch = "x86_64", target_family = "unix"))]
+fn libc_thresholds_cache_path(path: &str) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let dev = metadata.dev();
+    let ino = metadata.ino();
+    let size = metadata.len();
+    let mtime = metadata.mtime();
+    let mtime_nsec = metadata.mtime_nsec();
+    Some(format!(
+        "/tmp/rustld-libc-thresholds-{dev:x}-{ino:x}-{size:x}-{mtime:x}-{mtime_nsec:x}.cache"
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_libc_thresholds_cache_line(line: &str) -> Option<LibcCopyThresholdOffsets> {
+    let mut parts = line.split_whitespace();
+    let mut next_hex = || usize::from_str_radix(parts.next()?, 16).ok();
+
+    let offsets = LibcCopyThresholdOffsets {
+        rep_stosb: next_hex()?,
+        rep_movsb: next_hex()?,
+        shared_cache_size: next_hex()?,
+        shared_cache_half: next_hex()?,
+        rep_movsb_stop: next_hex()?,
+        memset_non_temporal: next_hex()?,
+        shared_non_temporal: next_hex()?,
+    };
+    Some(offsets)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn load_libc_thresholds_offsets_from_cache(path: &str) -> Option<LibcCopyThresholdOffsets> {
+    #[cfg(target_family = "unix")]
+    {
+        let cache_path = libc_thresholds_cache_path(path)?;
+        let cache = fs::read_to_string(cache_path).ok()?;
+        return parse_libc_thresholds_cache_line(cache.trim());
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn store_libc_thresholds_offsets_cache(path: &str, offsets: &LibcCopyThresholdOffsets) {
+    #[cfg(target_family = "unix")]
+    {
+        if let Some(cache_path) = libc_thresholds_cache_path(path) {
+            let payload = format!(
+                "{:x} {:x} {:x} {:x} {:x} {:x} {:x}\n",
+                offsets.rep_stosb,
+                offsets.rep_movsb,
+                offsets.shared_cache_size,
+                offsets.shared_cache_half,
+                offsets.rep_movsb_stop,
+                offsets.memset_non_temporal,
+                offsets.shared_non_temporal
+            );
+            let _ = fs::write(cache_path, payload);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn load_libc_copy_threshold_offsets_from_symtab(path: &str) -> Option<LibcCopyThresholdOffsets> {
     const SHT_SYMTAB: u32 = 2;
+
+    if let Some(cached) = load_libc_thresholds_offsets_from_cache(path) {
+        return Some(cached);
+    }
 
     let bytes = fs::read(path).ok()?;
     if bytes.len() < size_of::<ElfHeader>() {
@@ -1086,28 +1221,51 @@ unsafe fn load_libc_copy_threshold_offsets_from_symtab(path: &str) -> Option<Lib
             let Some(term) = name_bytes.iter().position(|&b| b == 0) else {
                 continue;
             };
-            let Ok(name) = core::str::from_utf8(&name_bytes[..term]) else {
-                continue;
-            };
+            let name = &name_bytes[..term];
 
-            match name {
-                "__x86_rep_stosb_threshold" => rep_stosb = Some(sym.st_value as usize),
-                "__x86_rep_movsb_threshold" => rep_movsb = Some(sym.st_value as usize),
-                "__x86_shared_cache_size" => shared_cache_size = Some(sym.st_value as usize),
-                "__x86_shared_cache_size_half" => shared_cache_half = Some(sym.st_value as usize),
-                "__x86_rep_movsb_stop_threshold" => rep_movsb_stop = Some(sym.st_value as usize),
-                "__x86_memset_non_temporal_threshold" => {
-                    memset_non_temporal = Some(sym.st_value as usize)
-                }
-                "__x86_shared_non_temporal_threshold" => {
-                    shared_non_temporal = Some(sym.st_value as usize)
-                }
-                _ => {}
+            if name == b"__x86_rep_stosb_threshold" {
+                rep_stosb = Some(sym.st_value as usize);
+            } else if name == b"__x86_rep_movsb_threshold" {
+                rep_movsb = Some(sym.st_value as usize);
+            } else if name == b"__x86_shared_cache_size" {
+                shared_cache_size = Some(sym.st_value as usize);
+            } else if name == b"__x86_shared_cache_size_half" {
+                shared_cache_half = Some(sym.st_value as usize);
+            } else if name == b"__x86_rep_movsb_stop_threshold" {
+                rep_movsb_stop = Some(sym.st_value as usize);
+            } else if name == b"__x86_memset_non_temporal_threshold" {
+                memset_non_temporal = Some(sym.st_value as usize);
+            } else if name == b"__x86_shared_non_temporal_threshold" {
+                shared_non_temporal = Some(sym.st_value as usize);
             }
+
+            if libc_thresholds_offsets_complete(
+                rep_stosb,
+                rep_movsb,
+                shared_cache_size,
+                shared_cache_half,
+                rep_movsb_stop,
+                memset_non_temporal,
+                shared_non_temporal,
+            ) {
+                break;
+            }
+        }
+
+        if libc_thresholds_offsets_complete(
+            rep_stosb,
+            rep_movsb,
+            shared_cache_size,
+            shared_cache_half,
+            rep_movsb_stop,
+            memset_non_temporal,
+            shared_non_temporal,
+        ) {
+            break;
         }
     }
 
-    Some(LibcCopyThresholdOffsets {
+    let offsets = LibcCopyThresholdOffsets {
         rep_stosb: rep_stosb?,
         rep_movsb: rep_movsb?,
         shared_cache_size: shared_cache_size?,
@@ -1115,7 +1273,10 @@ unsafe fn load_libc_copy_threshold_offsets_from_symtab(path: &str) -> Option<Lib
         rep_movsb_stop: rep_movsb_stop?,
         memset_non_temporal: memset_non_temporal?,
         shared_non_temporal: shared_non_temporal?,
-    })
+    };
+
+    store_libc_thresholds_offsets_cache(path, &offsets);
+    Some(offsets)
 }
 
 #[cfg(target_arch = "x86_64")]

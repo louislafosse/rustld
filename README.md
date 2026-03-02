@@ -1,4 +1,7 @@
 # Rustld
+[![Crates.io](https://img.shields.io/crates/v/rustld.svg)](https://crates.io/crates/rustld)
+[![Documentation](https://docs.rs/rustld/badge.svg)](https://docs.rs/rustld)  
+
 A modern x86_64 & AArch64 ELF loader (static & dynamic linker + compatible glibc & musl) written in Rust
 
 ## Build

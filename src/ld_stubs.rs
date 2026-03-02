@@ -13,7 +13,7 @@ use crate::{
 };
 use core::ffi::{c_char, c_void};
 use core::mem::{size_of, MaybeUninit};
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 const SHN_ABS: u16 = 0xfff1;
 
@@ -91,6 +91,13 @@ const DLERROR_BUF_SIZE: usize = 256;
 static RTLD_LOCK_OWNER_TID: AtomicI32 = AtomicI32::new(0);
 static RTLD_LOCK_DEPTH: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(target_arch = "x86_64")]
+const TUNABLE_FORWARD_NONE: usize = 1;
+#[cfg(target_arch = "x86_64")]
+static TUNABLE_GET_VAL_FORWARD_ADDR: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
+static TUNABLE_IS_INIT_FORWARD_ADDR: AtomicUsize = AtomicUsize::new(0);
+
 #[cfg(debug_assertions)]
 static STUB_TRACE_REMAINING: AtomicU32 = AtomicU32::new(200);
 
@@ -114,6 +121,35 @@ fn debug_stub_trace(name: &str) {
 #[cfg(not(debug_assertions))]
 #[inline(always)]
 fn debug_stub_trace(_name: &str) {}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn resolve_tunable_forward_addr(
+    cache: &AtomicUsize,
+    symbol_name: &str,
+    self_addr: usize,
+) -> Option<usize> {
+    let cached = cache.load(Ordering::Relaxed);
+    if cached == TUNABLE_FORWARD_NONE {
+        return None;
+    }
+    if cached > TUNABLE_FORWARD_NONE {
+        return Some(cached);
+    }
+
+    let Some(resolved) = (unsafe { linking::lookup_active_symbol(symbol_name) }) else {
+        // Cache negative lookups to avoid repeated global symbol scans
+        // while glibc probes tunables during startup.
+        cache.store(TUNABLE_FORWARD_NONE, Ordering::Relaxed);
+        return None;
+    };
+    if resolved == self_addr {
+        cache.store(TUNABLE_FORWARD_NONE, Ordering::Relaxed);
+        return None;
+    }
+    cache.store(resolved, Ordering::Relaxed);
+    Some(resolved)
+}
 
 struct RtldOpGuard {
     tid: i32,
@@ -1782,13 +1818,15 @@ pub extern "C" fn __tunable_is_initialized(_id: usize) -> i32 {
     debug_stub_trace("__tunable_is_initialized");
     #[cfg(target_arch = "x86_64")]
     {
-        if let Some(addr) = unsafe { linking::lookup_active_symbol("__tunable_is_initialized") } {
-            let self_addr = __tunable_is_initialized as *const () as usize;
-            if addr != self_addr {
-                unsafe {
-                    let func: extern "C" fn(usize) -> i32 = core::mem::transmute(addr);
-                    return func(_id);
-                }
+        let self_addr = __tunable_is_initialized as *const () as usize;
+        if let Some(addr) = resolve_tunable_forward_addr(
+            &TUNABLE_IS_INIT_FORWARD_ADDR,
+            "__tunable_is_initialized",
+            self_addr,
+        ) {
+            unsafe {
+                let func: extern "C" fn(usize) -> i32 = core::mem::transmute(addr);
+                return func(_id);
             }
         }
     }
@@ -1807,14 +1845,14 @@ pub extern "C" fn __tunable_get_val(_id: usize, valp: *mut (), callback: *const 
 
     #[cfg(target_arch = "x86_64")]
     {
-        if let Some(addr) = unsafe { linking::lookup_active_symbol("__tunable_get_val") } {
-            let self_addr = __tunable_get_val as *const () as usize;
-            if addr != self_addr {
-                unsafe {
-                    let func: extern "C" fn(usize, *mut (), *const ()) = core::mem::transmute(addr);
-                    func(_id, valp, callback);
-                    return;
-                }
+        let self_addr = __tunable_get_val as *const () as usize;
+        if let Some(addr) =
+            resolve_tunable_forward_addr(&TUNABLE_GET_VAL_FORWARD_ADDR, "__tunable_get_val", self_addr)
+        {
+            unsafe {
+                let func: extern "C" fn(usize, *mut (), *const ()) = core::mem::transmute(addr);
+                func(_id, valp, callback);
+                return;
             }
         }
 

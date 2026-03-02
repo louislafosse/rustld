@@ -1,7 +1,9 @@
 [package]
 name = "rustld"
-version = "0.1.0"
+version = "0.1.43"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/louislafosse/rustld"
 description = "A modern ELF loader (static & dynamic linker + compatible glibc & musl) written in Rust"
 
 [lib]
@@ -30,6 +32,10 @@ debug = false
 panic = "abort"
 incremental = true
 debug = true
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["mmap_allocator"]
