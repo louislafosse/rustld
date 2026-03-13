@@ -16,10 +16,6 @@ pub unsafe fn get_page_start(address: usize) -> usize {
     address & !(get_page_size() - 1)
 }
 
-pub unsafe fn get_page_offset(address: usize) -> usize {
-    address & (get_page_size() - 1)
-}
-
 pub unsafe fn get_page_end(address: usize) -> usize {
     get_page_start(address + get_page_size() - 1)
 }

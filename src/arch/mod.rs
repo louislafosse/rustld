@@ -41,15 +41,6 @@ pub(crate) fn close(fd: i32) -> isize {
 }
 
 #[inline(always)]
-pub(crate) unsafe fn execve(
-    path_ptr: *const c_char,
-    argv: *const *const c_char,
-    envp: *const *const c_char,
-) -> isize {
-    imp::execve(path_ptr, argv, envp)
-}
-
-#[inline(always)]
 pub(crate) unsafe fn close_fd(fd: i32) {
     imp::close_fd(fd);
 }

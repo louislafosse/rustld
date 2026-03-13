@@ -38,10 +38,15 @@ fn get_stub_symbol(name: &str) -> Option<usize> {
         "_dl_deallocate_tls" => || _dl_deallocate_tls as *const () as usize,
         "_dl_signal_error" => || _dl_signal_error as *const () as usize,
         "_dl_signal_exception" => || _dl_signal_exception as *const () as usize,
+        "_dl_exception_create" => || _dl_exception_create as *const () as usize,
+        "_dl_exception_create_format" => || _dl_exception_create_format as *const () as usize,
+        "_dl_exception_free" => || _dl_exception_free as *const () as usize,
         "_dl_catch_exception" => || _dl_catch_exception as *const () as usize,
         "_dl_catch_error" => || _dl_catch_error as *const () as usize,
         "_dl_audit_symbind_alt" => || _dl_audit_symbind_alt as *const () as usize,
         "_dl_rtld_di_serinfo" => || _dl_rtld_di_serinfo as *const () as usize,
+        "_dl_make_stack_executable" => || _dl_make_stack_executable as *const () as usize,
+        "_dl_get_tls_static_info" => || _dl_get_tls_static_info as *const () as usize,
         "__tunable_is_initialized" => || __tunable_is_initialized as *const () as usize,
         "__tunable_get_val" => || __tunable_get_val as *const () as usize,
         "__nptl_change_stack_perm" => || __nptl_change_stack_perm as *const () as usize,
@@ -59,6 +64,7 @@ fn get_stub_symbol(name: &str) -> Option<usize> {
         "getcon" => || getcon as *const () as usize,
         "getfilecon" => || getfilecon as *const () as usize,
         "lgetfilecon" => || lgetfilecon as *const () as usize,
+        "fgetfilecon" => || fgetfilecon as *const () as usize,
         "getfilecon_raw" => || getfilecon_raw as *const () as usize,
     };
 
@@ -87,6 +93,7 @@ fn is_stub_preferred(name: &str) -> bool {
                 | "getcon"
                 | "getfilecon"
                 | "lgetfilecon"
+                | "fgetfilecon"
                 | "getfilecon_raw"
         )
 }

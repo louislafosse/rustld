@@ -12,7 +12,11 @@ use crate::syscall::relocation;
 use crate::{
     arch,
     elf::{
-        dynamic_array::{DynamicArrayItem, DT_DEBUG, DT_NULL},
+        dynamic_array::{
+            DynamicArrayItem, DT_DEBUG, DT_FINI, DT_FINI_ARRAY, DT_GNU_HASH, DT_HASH, DT_INIT,
+            DT_INIT_ARRAY, DT_JMPREL, DT_NULL, DT_PLTGOT, DT_REL, DT_RELA, DT_RELR, DT_STRTAB,
+            DT_SYMTAB, DT_VERSYM,
+        },
         header::ElfHeader,
         relocate::Relocatable,
         symbol::{Symbol, SymbolVisibility},
@@ -59,6 +63,10 @@ const DT_ADDRNUM: usize = 11;
 const DT_VERNEEDNUM: usize = 0x6fffffff;
 const DT_VERSIONTAGNUM: usize = 16;
 const DT_EXTRANUM: usize = 3;
+const DT_PREINIT_ARRAY: usize = 32;
+const DT_VERDEF: usize = 0x6ffffffc;
+const DT_VERNEED: usize = 0x6ffffffe;
+const LINK_MAP_DYNAMIC_COPY_CAPACITY: usize = 256;
 
 const L_INFO_VERSION_BASE: usize = DT_NUM;
 const L_INFO_EXTRA_BASE: usize = L_INFO_VERSION_BASE + DT_VERSIONTAGNUM;
@@ -84,6 +92,12 @@ const RTLD_RO_DLCLOSE_OFFSET: usize = 0x350;
 const RTLD_RO_CATCH_ERROR_OFFSET: usize = 0x358;
 #[cfg(target_arch = "x86_64")]
 const RTLD_RO_ERROR_FREE_OFFSET: usize = 0x360;
+#[cfg(target_arch = "x86_64")]
+const RTLD_GLOBAL_LEGACY_LOCK_OFFSET: usize = 0x908;
+#[cfg(target_arch = "x86_64")]
+const RTLD_GLOBAL_LEGACY_LOCK_ACQUIRE_OFFSET: usize = 0xf08;
+#[cfg(target_arch = "x86_64")]
+const RTLD_GLOBAL_LEGACY_LOCK_RELEASE_OFFSET: usize = 0xf10;
 
 #[cfg(target_arch = "aarch64")]
 const RTLD_RO_LOOKUP_SYMBOL_X_OFFSET: usize = 0x128;
@@ -99,6 +113,7 @@ const RTLD_RO_ERROR_FREE_OFFSET: usize = 0x148;
 static mut ACTIVE_LINKER: *mut DynamicLinker = core::ptr::null_mut();
 static CONFIGURED_LIBRARY_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 static LD_LIBRARY_PATH: OnceLock<Option<String>> = OnceLock::new();
+static RUSTLD_LIBRARY_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 #[inline(always)]
 fn strip_version_suffix(name: &str) -> &str {
@@ -190,9 +205,7 @@ fn link_map_info_index(tag: usize) -> Option<usize> {
 }
 
 unsafe fn populate_link_map_dynamic_info(map: *mut u8, dynamic: *const DynamicArrayItem) {
-    if dynamic.is_null()
-        || (dynamic as usize) % core::mem::align_of::<DynamicArrayItem>() != 0
-    {
+    if dynamic.is_null() || (dynamic as usize) % core::mem::align_of::<DynamicArrayItem>() != 0 {
         return;
     }
 
@@ -219,6 +232,111 @@ unsafe fn populate_link_map_dynamic_info(map: *mut u8, dynamic: *const DynamicAr
     }
 }
 
+#[inline]
+fn dynamic_tag_uses_runtime_pointer(tag: usize) -> bool {
+    matches!(
+        tag,
+        DT_PLTGOT
+            | DT_HASH
+            | DT_STRTAB
+            | DT_SYMTAB
+            | DT_RELA
+            | DT_REL
+            | DT_INIT
+            | DT_FINI
+            | DT_DEBUG
+            | DT_JMPREL
+            | DT_INIT_ARRAY
+            | DT_FINI_ARRAY
+            | DT_PREINIT_ARRAY
+            | DT_RELR
+            | DT_GNU_HASH
+            | DT_VERSYM
+            | DT_VERDEF
+            | DT_VERNEED
+    ) || (DT_ADDRRNGLO..=DT_ADDRRNGHI).contains(&tag)
+}
+
+fn legacy_glibc_link_map_needs_absolute_dynamic(path_hint: &str) -> bool {
+    let canonical = fs::canonicalize(path_hint).ok();
+    let candidate = canonical
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or(path_hint);
+
+    for prefix in ["libc-", "libpthread-", "libdl-", "ld-"] {
+        let Some(rest) = candidate.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_suffix(".so") else {
+            continue;
+        };
+        let mut parts = rest.split('.');
+        let Some(major_raw) = parts.next() else {
+            continue;
+        };
+        let Some(minor_raw) = parts.next() else {
+            continue;
+        };
+        let Ok(major) = major_raw.parse::<u32>() else {
+            continue;
+        };
+        let Ok(minor) = minor_raw.parse::<u32>() else {
+            continue;
+        };
+        return major == 2 && minor <= 31;
+    }
+
+    false
+}
+
+unsafe fn create_link_map_dynamic_copy(
+    base: usize,
+    dynamic: *const DynamicArrayItem,
+) -> *mut DynamicArrayItem {
+    if dynamic.is_null() || (dynamic as usize) % core::mem::align_of::<DynamicArrayItem>() != 0 {
+        return core::ptr::null_mut();
+    }
+
+    let allocation_size = LINK_MAP_DYNAMIC_COPY_CAPACITY * size_of::<DynamicArrayItem>();
+    let copy = mmap(
+        null_mut(),
+        allocation_size,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    ) as *mut DynamicArrayItem;
+    if copy.is_null() || (copy as isize) < 0 {
+        return core::ptr::null_mut();
+    }
+    core::ptr::write_bytes(copy.cast::<u8>(), 0, allocation_size);
+
+    let mut src = dynamic;
+    let mut dst = copy;
+    for _ in 0..LINK_MAP_DYNAMIC_COPY_CAPACITY.saturating_sub(1) {
+        let item = *src;
+        *dst = item;
+        if item.d_tag == DT_NULL {
+            return copy;
+        }
+
+        if item.d_tag == DT_DEBUG {
+            (*dst).d_un.d_ptr = ld_stubs::r_debug_ptr();
+        } else if dynamic_tag_uses_runtime_pointer(item.d_tag) {
+            (*dst).d_un.d_ptr = base.wrapping_add(item.d_un.d_val) as *mut c_void;
+        }
+
+        src = src.add(1);
+        dst = dst.add(1);
+    }
+
+    (*dst).d_tag = DT_NULL;
+    (*dst).d_un.d_val = 0;
+    copy
+}
+
 /// Minimal stub for _rtld_global.
 /// _dl_ns[0]._ns_loaded (offset 0) must point to a valid link_map so
 /// __libc_start_main can read l_info[].
@@ -232,6 +350,8 @@ struct RtldStubs {
     rtld_global_ro: *mut u8,
     /// Pointer to a zeroed dummy link_map (≥ 0x300 bytes)
     link_map: *mut u8,
+    /// Runtime-adjusted copy of the executable `_DYNAMIC`.
+    link_map_dynamic: *mut DynamicArrayItem,
     /// Storage for standalone ld.so globals referenced by libc.
     libc_enable_secure: *mut u32,
     libc_stack_end: *mut *const u8,
@@ -329,11 +449,12 @@ impl RtldStubs {
         //   offset 0x20: l_prev = NULL
         //   offset 0x28: l_real = self pointer
         //   offset 0x40..0x2E0: l_info[] — pointers to DT entries (leave NULL)
+        let link_map_dynamic = exec_dynamic.cast::<DynamicArrayItem>() as *mut DynamicArrayItem;
         *(link_map.byte_add(LINK_MAP_L_ADDR_OFFSET) as *mut usize) = exec_base;
         *(link_map.byte_add(LINK_MAP_L_NAME_OFFSET) as *mut *const u8) = b"\0".as_ptr();
-        *(link_map.byte_add(LINK_MAP_L_LD_OFFSET) as *mut *const u8) = exec_dynamic;
+        *(link_map.byte_add(LINK_MAP_L_LD_OFFSET) as *mut *const u8) = link_map_dynamic.cast();
         *(link_map.byte_add(LINK_MAP_L_REAL_OFFSET) as *mut *mut u8) = link_map;
-        populate_link_map_dynamic_info(link_map, exec_dynamic.cast::<DynamicArrayItem>());
+        populate_link_map_dynamic_info(link_map, link_map_dynamic.cast_const());
 
         // Set up _rtld_global:
         //   offset 0x00: _dl_ns[0]._ns_loaded = &link_map
@@ -345,6 +466,16 @@ impl RtldStubs {
             *(rtld_global as *mut *mut u8) = link_map; // _dl_ns[0]._ns_loaded
             *(rtld_global.byte_add(0x08) as *mut u32) = 1; // _dl_ns[0]._ns_nloaded
             *(rtld_global.byte_add(0x700) as *mut usize) = 1; // _dl_nns
+            // Older x86_64 glibc releases (for example Ubuntu 20.04 / glibc
+            // 2.31) call a pair of tiny lock helpers via `_rtld_global +
+            // 0xf08` / `+0xf10` from `_dl_addr@@GLIBC_PRIVATE`.
+            // The real loader wires these to increment/decrement the counter
+            // at `_rtld_global + 0x908 + 4`.
+            *(rtld_global.byte_add(RTLD_GLOBAL_LEGACY_LOCK_OFFSET + 4) as *mut i32) = 0;
+            *(rtld_global.byte_add(RTLD_GLOBAL_LEGACY_LOCK_ACQUIRE_OFFSET) as *mut usize) =
+                ld_stubs::__rustld_rtld_legacy_lock_acquire as *const () as usize;
+            *(rtld_global.byte_add(RTLD_GLOBAL_LEGACY_LOCK_RELEASE_OFFSET) as *mut usize) =
+                ld_stubs::__rustld_rtld_legacy_lock_release as *const () as usize;
         }
         // libpthread/glibc fork paths consult multiple rtld-managed intrusive
         // list heads in this region. Model each head as an empty self-linked
@@ -409,7 +540,9 @@ impl RtldStubs {
                 if (*cursor).a_type == AT_RANDOM {
                     let random = (*cursor).a_un.a_val as *const usize;
                     if !random.is_null() {
-                        *stack_chk_guard = core::ptr::read_unaligned(random);
+                        let mut stack_guard = core::ptr::read_unaligned(random);
+                        stack_guard &= !0xffusize;
+                        *stack_chk_guard = stack_guard;
                         let pointer_guard = core::ptr::read_unaligned(random.add(1));
                         *pointer_chk_guard = pointer_guard;
                         *pointer_chk_guard_local = pointer_guard;
@@ -427,6 +560,7 @@ impl RtldStubs {
             rtld_global,
             rtld_global_ro,
             link_map,
+            link_map_dynamic,
             libc_enable_secure,
             libc_stack_end,
             dl_argv,
@@ -460,6 +594,13 @@ impl RtldStubs {
         *self.rseq_flags = flags;
     }
 
+    unsafe fn tls_static_metadata(&self) -> (usize, usize) {
+        (
+            *(self.rtld_global_ro.byte_add(0x2A0) as *const usize),
+            *(self.rtld_global_ro.byte_add(0x2A8) as *const usize),
+        )
+    }
+
     unsafe fn set_ns_loaded_head(&self, map: *mut u8) {
         *(self.rtld_global.byte_add(0x00) as *mut *mut u8) = map;
     }
@@ -477,6 +618,8 @@ pub struct DynamicLinker {
     object_paths: Vec<Option<String>>,
     /// Stable `struct link_map` stand-ins for loaded objects.
     object_link_maps: Vec<*mut u8>,
+    /// Runtime-adjusted `_DYNAMIC` copies backing the link_maps.
+    object_link_map_dynamics: Vec<*mut DynamicArrayItem>,
     /// Owned C-strings backing `l_name` pointers.
     object_link_map_names: Vec<*mut c_char>,
     /// Precomputed lookup order per requester object index.
@@ -499,6 +642,7 @@ impl DynamicLinker {
                 "/lib64/ld-musl-x86_64.so.1",
                 "/usr/x86_64-linux-musl/lib/ld-musl-x86_64.so.1",
                 "/usr/x86_64-linux-musl/lib64/ld-musl-x86_64.so.1",
+                "/usr/lib/ld-musl-x86_64.so.1",
             ];
         }
 
@@ -509,11 +653,29 @@ impl DynamicLinker {
                 "/lib64/ld-musl-aarch64.so.1",
                 "/usr/aarch64-linux-musl/lib/ld-musl-aarch64.so.1",
                 "/usr/aarch64-linux-musl/lib64/ld-musl-aarch64.so.1",
+                "/usr/lib/ld-musl-aarch64.so.1",
             ];
         }
 
         #[allow(unreachable_code)]
         &[]
+    }
+
+    #[inline(always)]
+    fn is_system_bin_dir(dir: &str) -> bool {
+        matches!(dir, "/bin" | "/usr/bin" | "/sbin" | "/usr/sbin")
+    }
+
+    #[inline(always)]
+    fn is_shared_object_soname(name: &str) -> bool {
+        if name.contains('/') {
+            return false;
+        }
+        let base = name.rsplit('/').next().unwrap_or(name);
+        if base.starts_with("ld-linux") || base.starts_with("ld-musl") {
+            return true;
+        }
+        base.starts_with("lib") && base.contains(".so")
     }
 
     #[inline(always)]
@@ -739,24 +901,6 @@ impl DynamicLinker {
         order
     }
 
-    pub unsafe fn call_fini_for_loaded_objects(&self) {
-        if self.objects.len() <= 1 {
-            return;
-        }
-        let skip_selinux_fini = skip_selinux_ctors();
-        let order = self.dependency_init_order(1);
-        for &idx in order.iter().rev() {
-            if skip_selinux_fini
-                && self.objects[idx]
-                    .soname_str()
-                    .is_some_and(|soname| soname == "libselinux.so.1")
-            {
-                continue;
-            }
-            self.objects[idx].call_fini_functions();
-        }
-    }
-
     pub unsafe fn new() -> Self {
         Self {
             objects: Vec::new(),
@@ -764,6 +908,7 @@ impl DynamicLinker {
             library_alias_index: FxHashMap::default(),
             object_paths: Vec::new(),
             object_link_maps: Vec::new(),
+            object_link_map_dynamics: Vec::new(),
             object_link_map_names: Vec::new(),
             lookup_scopes: Vec::new(),
             rtld_stubs: None,
@@ -989,15 +1134,26 @@ impl DynamicLinker {
             } else {
                 self.objects[index].dynamic
             };
+            let dynamic_copy =
+                if legacy_glibc_link_map_needs_absolute_dynamic(name_hint) {
+                    create_link_map_dynamic_copy(self.objects[index].base, dynamic_for_link_map)
+                } else {
+                    core::ptr::null_mut()
+                };
+            let link_map_dynamic = if dynamic_copy.is_null() {
+                dynamic_for_link_map as *mut DynamicArrayItem
+            } else {
+                dynamic_copy
+            };
             core::ptr::write_bytes(map, 0, LINK_MAP_SIZE);
             *(map.byte_add(LINK_MAP_L_ADDR_OFFSET) as *mut usize) = self.objects[index].base;
             *(map.byte_add(LINK_MAP_L_NAME_OFFSET) as *mut *const c_char) = raw_name;
             *(map.byte_add(LINK_MAP_L_LD_OFFSET) as *mut *const c_void) =
-                dynamic_for_link_map as *const c_void;
+                link_map_dynamic as *const c_void;
             *(map.byte_add(LINK_MAP_L_NEXT_OFFSET) as *mut *mut u8) = core::ptr::null_mut();
             *(map.byte_add(LINK_MAP_L_PREV_OFFSET) as *mut *mut u8) = previous;
             *(map.byte_add(LINK_MAP_L_REAL_OFFSET) as *mut *mut u8) = map;
-            populate_link_map_dynamic_info(map, dynamic_for_link_map);
+            populate_link_map_dynamic_info(map, link_map_dynamic.cast_const());
 
             if !previous.is_null() {
                 *(previous.byte_add(LINK_MAP_L_NEXT_OFFSET) as *mut *mut u8) = map;
@@ -1012,6 +1168,9 @@ impl DynamicLinker {
         }
 
         self.object_link_maps.push(map);
+        self.object_link_map_dynamics.push(unsafe {
+            *(map.byte_add(LINK_MAP_L_LD_OFFSET) as *const *mut DynamicArrayItem)
+        });
         self.object_link_map_names.push(raw_name);
 
         // Expose the real loaded-object list head to libc/libdl helpers.
@@ -1043,6 +1202,7 @@ impl DynamicLinker {
         } else {
             // musl-target path: runtime dl* stubs can use synthetic handles.
             self.object_link_maps.push(core::ptr::null_mut());
+            self.object_link_map_dynamics.push(core::ptr::null_mut());
             self.object_link_map_names.push(core::ptr::null_mut());
         }
         self.map_alias(name, index);
@@ -1058,10 +1218,6 @@ impl DynamicLinker {
         // Topology changed; caller should rebuild scopes before heavy lookup phase.
         self.lookup_scopes.clear();
         index
-    }
-
-    pub fn add_object(&mut self, name: String, object: SharedObject) {
-        let _ = self.add_object_with_path(name, None, object);
     }
 
     pub fn loaded_index(&self, name: &str) -> Option<usize> {
@@ -1206,19 +1362,24 @@ impl DynamicLinker {
         None
     }
 
-    fn ld_library_path_from_env() -> Option<&'static str> {
-        LD_LIBRARY_PATH
+    fn env_var_from_environ(cache: &'static OnceLock<Option<String>>, key: &str) -> Option<&'static str> {
+        cache
             .get_or_init(|| {
                 let env_pointer = unsafe { crate::libc::environ::get_environ_pointer() };
                 if env_pointer.is_null() {
                     return None;
                 }
 
+                let mut prefix = String::with_capacity(key.len() + 1);
+                prefix.push_str(key);
+                prefix.push('=');
+                let prefix = prefix.into_bytes();
+
                 let mut cursor = env_pointer;
                 while unsafe { !(*cursor).is_null() } {
                     let entry_ptr = unsafe { *cursor } as *const c_char;
                     let entry = unsafe { CStr::from_ptr(entry_ptr).to_bytes() };
-                    if let Some(value) = entry.strip_prefix(b"LD_LIBRARY_PATH=") {
+                    if let Some(value) = entry.strip_prefix(prefix.as_slice()) {
                         if let Ok(text) = core::str::from_utf8(value) {
                             return Some(text.to_string());
                         }
@@ -1228,6 +1389,14 @@ impl DynamicLinker {
                 None
             })
             .as_deref()
+    }
+
+    fn rustld_library_path_from_env() -> Option<&'static str> {
+        Self::env_var_from_environ(&RUSTLD_LIBRARY_PATH, "RUSTLD_LIBRARY_PATH")
+    }
+
+    fn ld_library_path_from_env() -> Option<&'static str> {
+        Self::env_var_from_environ(&LD_LIBRARY_PATH, "LD_LIBRARY_PATH")
     }
 
     unsafe fn openat_raw(path_ptr: *const c_char) -> isize {
@@ -1262,6 +1431,12 @@ impl DynamicLinker {
             }
         }
 
+        if let Some(rustld_library_path) = Self::rustld_library_path_from_env() {
+            if let Some(found) = self.try_open_from_search_list(rustld_library_path, origin, name) {
+                return Some(found);
+            }
+        }
+
         if let Some(ld_library_path) = Self::ld_library_path_from_env() {
             if let Some(found) = self.try_open_from_search_list(ld_library_path, origin, name) {
                 return Some(found);
@@ -1274,13 +1449,20 @@ impl DynamicLinker {
             }
         }
 
+        let skip_system_origin_probe =
+            Self::is_shared_object_soname(name) && origin.is_some_and(Self::is_system_bin_dir);
+
         if let Some(origin_dir) = origin {
-            if let Some(found) = Self::open_joined_path(origin_dir, name) {
-                return Some(found);
+            if !skip_system_origin_probe {
+                if let Some(found) = Self::open_joined_path(origin_dir, name) {
+                    return Some(found);
+                }
             }
         }
         if let Some(main_origin) = self.object_origin_dir(0) {
-            if origin != Some(main_origin) {
+            let skip_main_origin_probe =
+                Self::is_shared_object_soname(name) && Self::is_system_bin_dir(main_origin);
+            if origin != Some(main_origin) && !skip_main_origin_probe {
                 if let Some(found) = Self::open_joined_path(main_origin, name) {
                     return Some(found);
                 }
@@ -1304,6 +1486,7 @@ impl DynamicLinker {
                 return Some(((*fallback).to_string(), fd));
             }
         }
+
         None
     }
 
@@ -1360,6 +1543,14 @@ impl DynamicLinker {
                 write::write_str(write::STD_ERR, " -> existing\n");
             }
             return Ok(idx);
+        }
+
+        if allow_selinux_stub
+            && Self::selinux_stub_enabled()
+            && Self::should_stub_selinux_library(name)
+        {
+            self.map_alias(name.to_string(), usize::MAX);
+            return Ok(usize::MAX);
         }
 
         if cfg!(target_arch = "x86_64") && name.starts_with("ld-linux") {
@@ -1430,6 +1621,16 @@ impl DynamicLinker {
         }
 
         Ok(idx)
+    }
+
+    #[inline(always)]
+    fn should_stub_selinux_library(name: &str) -> bool {
+        name == "libselinux.so.1" || name.ends_with("/libselinux.so.1")
+    }
+
+    #[inline(always)]
+    fn selinux_stub_enabled() -> bool {
+        false
     }
 
     pub unsafe fn load_library(
@@ -1881,6 +2082,12 @@ impl DynamicLinker {
             .copied()
             .unwrap_or(core::ptr::null_mut())
             .cast_const()
+    }
+
+    pub unsafe fn tls_static_metadata(&self) -> Option<(usize, usize)> {
+        self.rtld_stubs
+            .as_ref()
+            .map(|stubs| stubs.tls_static_metadata())
     }
 
     pub fn object_index_for_link_map_ptr(&self, map_ptr: *const c_void) -> Option<usize> {

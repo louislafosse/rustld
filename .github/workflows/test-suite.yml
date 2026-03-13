@@ -54,7 +54,7 @@ jobs:
       - name: Build rustld (x86_64 + aarch64)
         run: |
           chmod +x tests/build_tests.sh tests/test_suite.sh
-          cargo build --example rustld
+          cargo clean -p rustld
           cargo build --release --example rustld
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
             cargo build --release --target aarch64-unknown-linux-gnu --example rustld
@@ -62,10 +62,17 @@ jobs:
       - name: Build Test Binaries
         run: ./tests/build_tests.sh
 
+      - name: Verify x86 rustld Binary
+        run: |
+          git rev-parse HEAD
+          ls -l ./target/release/examples/rustld
+          file ./target/release/examples/rustld
+          sha256sum ./target/release/examples/rustld
+
       - name: Run Test Suite
         env:
           AARCH64_ROOT: /tmp/aarch64-root
-          RUSTLD_X86: ./target/debug/examples/rustld
+          RUSTLD_X86: ./target/release/examples/rustld
         run: ./tests/test_suite.sh
 
       - name: Upload Test Suite Logs

@@ -560,7 +560,11 @@ pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [
 
     let stack_guard = if !pseudorandom_bytes.is_null() {
         let random = &*pseudorandom_bytes;
-        usize::from_ne_bytes(random[..size_of::<usize>()].try_into().unwrap())
+        let mut guard = usize::from_ne_bytes(random[..size_of::<usize>()].try_into().unwrap());
+        // Match glibc's stack canary convention: keep the low byte zero so
+        // simple string overflows are more likely to terminate at NUL.
+        guard &= !0xffusize;
+        guard
     } else {
         0
     };
@@ -898,14 +902,6 @@ unsafe fn initialize_tls_block(
     register_thread_tcb(tcb);
 
     Some(tcb)
-}
-
-#[allow(dead_code)]
-pub unsafe fn tls_state() -> Option<&'static TlsState> {
-    #[allow(static_mut_refs)]
-    {
-        TLS_STATE.as_ref()
-    }
 }
 
 pub unsafe fn tls_layout() -> Option<TlsLayout> {

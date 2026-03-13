@@ -1,8 +1,8 @@
+use crate::syscall::trampoline::indirect_syscall6;
 use core::{
     arch::{asm, global_asm},
     ffi::{c_char, c_void},
 };
-use crate::syscall::trampoline::indirect_syscall6;
 
 #[inline(always)]
 unsafe fn syscall0(number: usize) -> isize {
@@ -68,18 +68,6 @@ pub(crate) unsafe fn write(fd: i32, buf: *const c_void, len: usize) -> isize {
 pub(crate) fn close(fd: i32) -> isize {
     const CLOSE: usize = 57;
     unsafe { syscall1(CLOSE, fd as isize as usize) }
-}
-
-
-
-#[inline(always)]
-pub(crate) unsafe fn execve(
-    path_ptr: *const c_char,
-    argv: *const *const c_char,
-    envp: *const *const c_char,
-) -> isize {
-    const EXECVE: usize = 221;
-    syscall3(EXECVE, path_ptr as usize, argv as usize, envp as usize)
 }
 
 #[inline(always)]

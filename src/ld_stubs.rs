@@ -124,11 +124,29 @@ fn debug_stub_trace(_name: &str) {}
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
+fn allow_tunable_forwarding() -> bool {
+    std::env::var("RUSTLD_FORWARD_GLIBC_TUNABLES")
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 fn resolve_tunable_forward_addr(
     cache: &AtomicUsize,
     symbol_name: &str,
     self_addr: usize,
 ) -> Option<usize> {
+    if !allow_tunable_forwarding() {
+        return None;
+    }
+
     let cached = cache.load(Ordering::Relaxed);
     if cached == TUNABLE_FORWARD_NONE {
         return None;
@@ -137,9 +155,10 @@ fn resolve_tunable_forward_addr(
         return Some(cached);
     }
 
-    let Some(resolved) = (unsafe { linking::lookup_active_symbol(symbol_name) }) else {
-        // Cache negative lookups to avoid repeated global symbol scans
-        // while glibc probes tunables during startup.
+    let resolved = (unsafe { linking::lookup_active_symbol(symbol_name) })
+        .or_else(|| resolve_host_rtld_symbol(symbol_name));
+
+    let Some(resolved) = resolved else {
         cache.store(TUNABLE_FORWARD_NONE, Ordering::Relaxed);
         return None;
     };
@@ -147,8 +166,189 @@ fn resolve_tunable_forward_addr(
         cache.store(TUNABLE_FORWARD_NONE, Ordering::Relaxed);
         return None;
     }
+
     cache.store(resolved, Ordering::Relaxed);
     Some(resolved)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64SectionHeader {
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Sym {
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+const SHT_DYNSYM: u32 = 11;
+
+#[cfg(target_arch = "x86_64")]
+fn parse_maps_hex(raw: &str) -> Option<usize> {
+    usize::from_str_radix(raw, 16).ok()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn find_host_rtld_base_and_path() -> Option<(usize, String)> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        if !line.contains("ld-linux") {
+            continue;
+        }
+
+        let mut fields = line.split_whitespace();
+        let range = fields.next()?;
+        let _perms = fields.next()?;
+        let file_offset = fields.next()?;
+        let _dev = fields.next()?;
+        let _inode = fields.next()?;
+        let path = fields.next()?;
+
+        if !path.contains("ld-linux") {
+            continue;
+        }
+
+        let start_hex = range.split('-').next()?;
+        let start = parse_maps_hex(start_hex)?;
+        let offset = parse_maps_hex(file_offset)?;
+        let base = start.checked_sub(offset)?;
+        return Some((base, path.to_string()));
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dynsym_name_matches(candidate: &[u8], wanted: &str) -> bool {
+    if candidate == wanted.as_bytes() {
+        return true;
+    }
+    candidate.len() > wanted.len()
+        && candidate[wanted.len()] == b'@'
+        && &candidate[..wanted.len()] == wanted.as_bytes()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn resolve_dynsym_value(path: &str, symbol_name: &str) -> Option<usize> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < size_of::<ElfHeader>() {
+        return None;
+    }
+
+    let header = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<ElfHeader>()) };
+    if header.e_ident[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+
+    let shoff = header.e_shoff;
+    let shentsize = header.e_shentsize as usize;
+    let shnum = header.e_shnum as usize;
+    if shentsize < size_of::<Elf64SectionHeader>() || shnum == 0 {
+        return None;
+    }
+
+    let read_shdr = |index: usize| -> Option<Elf64SectionHeader> {
+        if index >= shnum {
+            return None;
+        }
+        let off = shoff.checked_add(index.checked_mul(shentsize)?)?;
+        let end = off.checked_add(size_of::<Elf64SectionHeader>())?;
+        if end > bytes.len() {
+            return None;
+        }
+        Some(unsafe {
+            core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64SectionHeader>())
+        })
+    };
+
+    for sec_idx in 0..shnum {
+        let shdr = read_shdr(sec_idx)?;
+        if shdr.sh_type != SHT_DYNSYM {
+            continue;
+        }
+
+        let strtab = read_shdr(shdr.sh_link as usize)?;
+        let strtab_start = strtab.sh_offset as usize;
+        let strtab_len = strtab.sh_size as usize;
+        if strtab_start
+            .checked_add(strtab_len)
+            .is_none_or(|end| end > bytes.len())
+        {
+            continue;
+        }
+        let strtab_bytes = &bytes[strtab_start..strtab_start + strtab_len];
+
+        let sym_size = if shdr.sh_entsize == 0 {
+            size_of::<Elf64Sym>()
+        } else {
+            shdr.sh_entsize as usize
+        };
+        if sym_size < size_of::<Elf64Sym>() {
+            continue;
+        }
+
+        let sym_start = shdr.sh_offset as usize;
+        let sym_len = shdr.sh_size as usize;
+        if sym_start
+            .checked_add(sym_len)
+            .is_none_or(|end| end > bytes.len())
+        {
+            continue;
+        }
+        let sym_count = sym_len / sym_size;
+
+        for sym_idx in 0..sym_count {
+            let off = sym_start + sym_idx * sym_size;
+            if off
+                .checked_add(size_of::<Elf64Sym>())
+                .is_none_or(|end| end > bytes.len())
+            {
+                break;
+            }
+            let sym = unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64Sym>()) };
+            if sym.st_name == 0 {
+                continue;
+            }
+
+            let name_off = sym.st_name as usize;
+            if name_off >= strtab_bytes.len() {
+                continue;
+            }
+            let tail = &strtab_bytes[name_off..];
+            let nul = tail.iter().position(|&b| b == 0)?;
+            let name = &tail[..nul];
+            if dynsym_name_matches(name, symbol_name) {
+                return Some(sym.st_value as usize);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn resolve_host_rtld_symbol(symbol_name: &str) -> Option<usize> {
+    let (base, path) = find_host_rtld_base_and_path()?;
+    let value = resolve_dynsym_value(&path, symbol_name)?;
+    Some(base.wrapping_add(value))
 }
 
 struct RtldOpGuard {
@@ -1281,6 +1481,14 @@ pub extern "C" fn lgetfilecon_raw(_path: *const u8, con: *mut *mut u8) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn fgetfilecon(_fd: i32, con: *mut *mut u8) -> i32 {
+    if !con.is_null() {
+        unsafe { *con = core::ptr::null_mut() };
+    }
+    -1
+}
+
+#[no_mangle]
 pub extern "C" fn fgetfilecon_raw(_fd: i32, con: *mut *mut u8) -> i32 {
     if !con.is_null() {
         unsafe { *con = core::ptr::null_mut() };
@@ -1609,6 +1817,52 @@ pub extern "C" fn _dl_signal_exception(_errcode: i32, _exception: *const ()) {
     _dl_signal_error(_errcode, core::ptr::null(), MSG.as_ptr().cast::<c_char>());
 }
 
+#[inline(always)]
+unsafe fn populate_dl_exception(
+    exception: *mut c_void,
+    objname: *const c_char,
+    errstring: *const c_char,
+) {
+    if exception.is_null() {
+        return;
+    }
+    let exception = exception.cast::<DlException>();
+    (*exception).objname = objname;
+    (*exception).errstring = errstring;
+    (*exception).message_buffer = core::ptr::null_mut();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _dl_exception_create(
+    exception: *mut c_void,
+    objname: *const c_char,
+    errstring: *const c_char,
+) {
+    debug_stub_trace("_dl_exception_create");
+    populate_dl_exception(exception, objname, errstring);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _dl_exception_create_format(
+    exception: *mut c_void,
+    objname: *const c_char,
+    errfmt: *const c_char,
+    mut _args: ...,
+) {
+    debug_stub_trace("_dl_exception_create_format");
+    populate_dl_exception(exception, objname, errfmt);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _dl_exception_free(exception: *mut c_void) {
+    debug_stub_trace("_dl_exception_free");
+    if exception.is_null() {
+        return;
+    }
+    let exception = exception.cast::<DlException>();
+    (*exception).message_buffer = core::ptr::null_mut();
+}
+
 #[no_mangle]
 pub extern "C" fn _dl_catch_exception(
     _exception: *mut (),
@@ -1793,6 +2047,34 @@ pub extern "C" fn __rustld_rtld_catch_error(
 /// rtld_global_ro + 0x360: internal error-string free helper used by dlerror_run().
 pub extern "C" fn __rustld_rtld_error_free(_errstring: *mut c_void) {}
 
+/// Legacy x86_64 glibc installs tiny lock helpers in `_rtld_global` and
+/// calls them from internal libc paths like `_dl_addr@@GLIBC_PRIVATE`.
+/// Ubuntu 20.04/glibc 2.31 uses `_rtld_global + 0xf08` and `+0xf10` for
+/// this pair. The real loader only bumps the recursion counter at `lock+4`.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+pub extern "C" fn __rustld_rtld_legacy_lock_acquire(lock: *mut u8) {
+    if lock.is_null() {
+        return;
+    }
+    let depth = unsafe { lock.add(4) as *mut i32 };
+    unsafe {
+        *depth = (*depth).wrapping_add(1);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+pub extern "C" fn __rustld_rtld_legacy_lock_release(lock: *mut u8) {
+    if lock.is_null() {
+        return;
+    }
+    let depth = unsafe { lock.add(4) as *mut i32 };
+    unsafe {
+        *depth = (*depth).wrapping_sub(1);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _dl_audit_symbind_alt(
     _sym: *const (),
@@ -1830,25 +2112,25 @@ pub extern "C" fn __tunable_is_initialized(_id: usize) -> i32 {
             }
         }
     }
+
     // Keep tunables handling entirely in rustld. Forwarding to glibc's
-    // internal implementation requires rtld state parity that rustld does not
-    // guarantee yet (can stall during startup on aarch64).
+    // internal implementation depends on glibc-private rtld state and can
+    // break across distro/glibc revisions.
     0
 }
 
 #[no_mangle]
 pub extern "C" fn __tunable_get_val(_id: usize, valp: *mut (), callback: *const ()) {
     debug_stub_trace("__tunable_get_val");
-    if valp.is_null() {
-        return;
-    }
 
     #[cfg(target_arch = "x86_64")]
     {
         let self_addr = __tunable_get_val as *const () as usize;
-        if let Some(addr) =
-            resolve_tunable_forward_addr(&TUNABLE_GET_VAL_FORWARD_ADDR, "__tunable_get_val", self_addr)
-        {
+        if let Some(addr) = resolve_tunable_forward_addr(
+            &TUNABLE_GET_VAL_FORWARD_ADDR,
+            "__tunable_get_val",
+            self_addr,
+        ) {
             unsafe {
                 let func: extern "C" fn(usize, *mut (), *const ()) = core::mem::transmute(addr);
                 func(_id, valp, callback);
@@ -1865,14 +2147,13 @@ pub extern "C" fn __tunable_get_val(_id: usize, valp: *mut (), callback: *const 
 
             unsafe {
                 // glibc callback expects pointer to tunable value payload.
-                let mut payload = TunableVal { numval: 0 };
+                // Zero-initialize the whole union so callbacks that read the
+                // string variant (ptr + len) never observe uninitialized bytes.
+                let mut payload = TunableVal { raw: [0; 2] };
                 let cb: extern "C" fn(*mut ()) = core::mem::transmute(callback);
                 cb((&mut payload as *mut TunableVal).cast::<()>());
             }
-        } else {
-            // Conservative ABI-safe fallback:
-            // writing more than 32 bits to valp is not safe across glibc builds
-            // because tunable id -> storage width is internal and varies.
+        } else if !valp.is_null() {
             unsafe {
                 core::ptr::write_unaligned(valp.cast::<i32>(), 0);
             }
@@ -1882,25 +2163,10 @@ pub extern "C" fn __tunable_get_val(_id: usize, valp: *mut (), callback: *const 
 
     #[cfg(not(target_arch = "x86_64"))]
     {
-        // aarch64 fallback: keep tunables handling entirely in rustld.
-        // Forwarding to glibc internals requires deeper rtld state parity.
-        unsafe {
-            if callback.is_null() {
-                // Scalar path: return deterministic zero.
-                core::ptr::write_unaligned(valp.cast::<i32>(), 0);
-            } else {
-                // Callback path: glibc expects a tunable value payload.
-                // Keep this conservative to avoid clobbering caller stack locals.
-                core::ptr::write_bytes(valp.cast::<u8>(), 0, size_of::<usize>());
-            }
-        }
-
-        if !callback.is_null() {
-            unsafe {
-                let cb: extern "C" fn(*mut ()) = core::mem::transmute(callback);
-                cb(valp);
-            }
-        }
+        // Keep tunables handling entirely in rustld on non-x86_64.
+        // Preserve caller defaults when no callback is provided.
+        let _ = valp;
+        let _ = callback;
     }
 }
 
@@ -1909,6 +2175,28 @@ pub extern "C" fn __nptl_change_stack_perm(_thread: *mut ()) -> i32 {
     // Ubuntu/Debian glibc may bind this GLIBC_PRIVATE symbol from libc to ld.so.
     // rustld does not expose full NPTL internals, so keep a conservative success stub.
     0
+}
+
+#[no_mangle]
+pub extern "C" fn _dl_make_stack_executable(_stack_endp: *mut *mut c_void) -> i32 {
+    debug_stub_trace("_dl_make_stack_executable");
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn _dl_get_tls_static_info(sizep: *mut usize, alignp: *mut usize) {
+    debug_stub_trace("_dl_get_tls_static_info");
+    let (size, align) = unsafe {
+        linking::active_linker()
+            .and_then(|linker| linker.tls_static_metadata())
+            .unwrap_or((0x1000, 0x10))
+    };
+    if !sizep.is_null() {
+        unsafe { core::ptr::write_unaligned(sizep, size) };
+    }
+    if !alignp.is_null() {
+        unsafe { core::ptr::write_unaligned(alignp, align.max(1)) };
+    }
 }
 
 #[no_mangle]

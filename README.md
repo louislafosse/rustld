@@ -7,6 +7,12 @@ A modern x86_64 & AArch64 ELF loader (static & dynamic linker + compatible glibc
 ## Build
 
 ```bash
+# Need gcc to compile
+sudo dnf install gcc
+
+# Need nightly toolchain
+rustup default nightly-x86_64-unknown-linux-gnu
+
 # Run any binary (static, glibc, musl) on host arch
 cargo build --release --example rustld
 ./target/release/examples/rustld /bin/ls

@@ -28,17 +28,17 @@ use crate::{
     tls,
 };
 use core::cmp::{max, min};
+#[cfg(all(target_arch = "x86_64", target_family = "unix"))]
+use std::os::unix::fs::MetadataExt;
 use std::{
     ffi::c_char,
     ffi::{CStr, CString},
     fs,
-    mem::{size_of, MaybeUninit},
+    mem::size_of,
     path::Path,
     ptr::{null, null_mut},
     slice,
 };
-#[cfg(all(target_arch = "x86_64", target_family = "unix"))]
-use std::os::unix::fs::MetadataExt;
 
 pub mod auxiliary_vector;
 pub mod environment_variables;
@@ -95,11 +95,6 @@ unsafe fn dependency_init_order(linker: &DynamicLinker, start_idx: usize) -> Sma
     order
 }
 
-enum TargetImageSource<'a> {
-    Path,
-    Bytes(&'a [u8]),
-}
-
 #[inline(always)]
 pub unsafe fn execute_elf_from_bytes(
     elf_bytes: &[u8],
@@ -115,11 +110,11 @@ pub unsafe fn execute_elf_from_bytes(
     entry_address: Option<usize>,
     verbose: bool,
 ) -> JumpInfo {
-    launch_target_with_source(
+    launch_target_from_bytes(
+        elf_bytes,
         target_argc,
         target_argv,
         env_pointer,
-        TargetImageSource::Bytes(elf_bytes),
         pseudorandom_bytes,
         minsigstacksize,
         hwcap,
@@ -132,11 +127,11 @@ pub unsafe fn execute_elf_from_bytes(
 }
 
 #[inline(always)]
-unsafe fn launch_target_with_source(
+unsafe fn launch_target_from_bytes(
+    elf_bytes: &[u8],
     target_argc: usize,
     target_argv: *const *const u8,
     env_pointer: *const *const u8,
-    source: TargetImageSource<'_>,
     pseudorandom_bytes: *const [u8; 16],
     minsigstacksize: usize,
     hwcap: usize,
@@ -147,14 +142,19 @@ unsafe fn launch_target_with_source(
     verbose: bool,
 ) -> JumpInfo {
     let target_path = *target_argv;
-    let target_path_string = cstr_ptr_to_string(target_path);
-    setup_jpackage_layout_compat(target_path_string.as_deref());
-
-    let image = match source {
-        TargetImageSource::Path => load_target_image(target_path),
-        TargetImageSource::Bytes(bytes) => load_target_image_from_bytes(bytes),
+    let target_path_string = if target_path.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(target_path.cast::<c_char>()) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     };
+
+    let image = load_target_image_from_bytes(elf_bytes);
     let mut selected_entry = image.entry;
+    let (effective_hwcap, effective_hwcap2) = sanitize_hwcap_for_target(&image, hwcap, hwcap2);
 
     if verbose {
         announce_target_elf_kind(&image);
@@ -171,8 +171,8 @@ unsafe fn launch_target_with_source(
     if minsigstacksize != 0 {
         set_auxv_val(&mut auxv_items, AT_MINSIGSTKSZ, minsigstacksize);
     }
-    set_auxv_val(&mut auxv_items, AT_HWCAP, hwcap);
-    set_auxv_val(&mut auxv_items, AT_HWCAP2, hwcap2);
+    set_auxv_val(&mut auxv_items, AT_HWCAP, effective_hwcap);
+    set_auxv_val(&mut auxv_items, AT_HWCAP2, effective_hwcap2);
     set_auxv_val(&mut auxv_items, AT_PAGE_SIZE, page_size::get_page_size());
     set_auxv_val(&mut auxv_items, AT_BASE, 0);
 
@@ -184,7 +184,6 @@ unsafe fn launch_target_with_source(
         .collect();
     let _leaked_env_storage = Box::leak(env_storage.into_boxed_slice());
     maybe_disable_glibc_rseq_under_valgrind(&mut env_list);
-    maybe_force_c_locale(&mut env_list);
     let auxv_string_storage = stabilize_auxv_string_pointers(&mut auxv_items);
     let _leaked_auxv_string_storage = Box::leak(auxv_string_storage.into_boxed_slice());
 
@@ -248,8 +247,8 @@ unsafe fn launch_target_with_source(
                 new_stack.add(1 + (target_argc + 1) + (env_list.len() + 1))
                     as *const AuxiliaryVectorItem,
                 auxv_items.len(),
-                hwcap,
-                hwcap2,
+                effective_hwcap,
+                effective_hwcap2,
             );
         }
         let new_auxv = new_auxv as *const AuxiliaryVectorItem;
@@ -814,19 +813,16 @@ unsafe fn startup_symbol_target_indices(linker: &DynamicLinker) -> SmallVec<[usi
 unsafe fn call_libc_early_init(linker: &DynamicLinker) {
     #[cfg(target_arch = "x86_64")]
     {
+        let force_early_init = allow_libc_early_init_on_unsupported_layout();
         // Our synthetic rtld_global/_ro layout is currently tuned for
         // /lib64-style glibc deployments. On Debian/Ubuntu multiarch layouts,
         // forcing __libc_early_init can crash (SIGFPE in CI).
-        if !x86_64_glibc_layout_supported(linker) {
-            #[cfg(debug_assertions)]
-            {
-                use crate::libc::fs::write;
-                write::write_str(
-                    write::STD_ERR,
-                    "loader: skipping __libc_early_init on unsupported x86_64 libc layout\n",
-                );
-            }
-            call_libc_ctype_init_fallback(linker);
+        if !x86_64_glibc_layout_supported(linker) && !force_early_init {
+            // Older Debian/Ubuntu glibc builds expose __ctype_init but expect
+            // rtld-internal TLS/locale state to already exist. Calling it
+            // directly from rustld can crash before the target reaches entry.
+            // On unsupported layouts, skip the manual libc init path entirely
+            // and let libc complete its own setup through normal startup.
             return;
         }
     }
@@ -858,31 +854,9 @@ unsafe fn call_libc_early_init(linker: &DynamicLinker) {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn call_libc_ctype_init_fallback(linker: &DynamicLinker) {
-    const SHN_ABS: u16 = 0xfff1;
-    if let Some((lib_idx, sym)) = linker.lookup_symbol("__ctype_init") {
-        let base = if sym.st_shndx == SHN_ABS {
-            0
-        } else {
-            linker.get_base(lib_idx)
-        };
-        let func_addr = base.wrapping_add(sym.st_value);
-        #[cfg(debug_assertions)]
-        {
-            use crate::libc::fs::write;
-            write::write_str(write::STD_ERR, "loader: __ctype_init fallback ");
-            write_hex(write::STD_ERR, func_addr);
-            write::write_str(write::STD_ERR, "\n");
-        }
-        let init_fn: extern "C" fn() = core::mem::transmute(func_addr);
-        init_fn();
-    } else {
-        #[cfg(debug_assertions)]
-        {
-            use crate::libc::fs::write;
-            write::write_str(write::STD_ERR, "loader: __ctype_init missing\n");
-        }
-    }
+#[inline(always)]
+fn allow_libc_early_init_on_unsupported_layout() -> bool {
+    false
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -937,13 +911,13 @@ unsafe fn patch_libc_copy_thresholds(linker: &DynamicLinker) {
     //   __x86_rep_movsb_stop_threshold
     //   __x86_memset_non_temporal_threshold
     //   __x86_shared_non_temporal_threshold
-    const LIBC_REP_STOSB_THRESHOLD: usize = 0x1e9210;
-    const LIBC_REP_MOVSB_THRESHOLD: usize = 0x1e9218;
-    const LIBC_SHARED_CACHE_SIZE: usize = 0x1e9220;
-    const LIBC_SHARED_CACHE_SIZE_HALF: usize = 0x1e9228;
-    const LIBC_REP_MOVSB_STOP_THRESHOLD: usize = 0x1f02c8;
-    const LIBC_MEMSET_NON_TEMPORAL_THRESHOLD: usize = 0x1f02d0;
-    const LIBC_SHARED_NON_TEMPORAL_THRESHOLD: usize = 0x1f02d8;
+    const LEGACY_REP_STOSB_THRESHOLD: usize = 0x1e9210;
+    const LEGACY_REP_MOVSB_THRESHOLD: usize = 0x1e9218;
+    const LEGACY_SHARED_CACHE_SIZE: usize = 0x1e9220;
+    const LEGACY_SHARED_CACHE_SIZE_HALF: usize = 0x1e9228;
+    const LEGACY_REP_MOVSB_STOP_THRESHOLD: usize = 0x1f02c8;
+    const LEGACY_MEMSET_NON_TEMPORAL_THRESHOLD: usize = 0x1f02d0;
+    const LEGACY_SHARED_NON_TEMPORAL_THRESHOLD: usize = 0x1f02d8;
 
     let libc_idx = find_libc_object_index(linker);
 
@@ -956,47 +930,111 @@ unsafe fn patch_libc_copy_thresholds(linker: &DynamicLinker) {
     };
     let base = linker.get_base(idx);
 
-    // Fast path on /lib64-style glibc layouts where offsets are known.
-    // This avoids expensive full symtab parsing on the hot startup path.
-    if libc_path.ends_with("/lib64/libc.so.6") || libc_path.ends_with("/usr/lib64/libc.so.6") {
+    // Prefer real symbol-derived offsets for the active libc file.
+    // This is portable across distro-specific glibc builds.
+    if let Some(symbol_offsets) = load_libc_copy_threshold_offsets_from_symtab(libc_path) {
+        if libc_thresholds_offsets_fit_object_map(linker, idx, base, &symbol_offsets) {
+            #[cfg(debug_assertions)]
+            {
+                use crate::libc::fs::write;
+                write::write_str(write::STD_ERR, "loader: libc thresholds via symtab ");
+                write::write_str(write::STD_ERR, libc_path);
+                write::write_str(write::STD_ERR, "\n");
+            }
+            apply_libc_copy_threshold_patch(base, &symbol_offsets);
+            return;
+        }
         #[cfg(debug_assertions)]
         {
             use crate::libc::fs::write;
-            write::write_str(write::STD_ERR, "loader: libc thresholds via fixed offsets ");
-            write::write_str(write::STD_ERR, libc_path);
-            write::write_str(write::STD_ERR, "\n");
+            write::write_str(
+                write::STD_ERR,
+                "loader: symtab-derived libc thresholds out of map; ignoring\n",
+            );
         }
-        let rep_stosb_ptr = (base.wrapping_add(LIBC_REP_STOSB_THRESHOLD)) as *mut usize;
-        let rep_movsb_ptr = (base.wrapping_add(LIBC_REP_MOVSB_THRESHOLD)) as *mut usize;
-        let shared_cache_size_ptr = (base.wrapping_add(LIBC_SHARED_CACHE_SIZE)) as *mut usize;
-        let shared_cache_half_ptr = (base.wrapping_add(LIBC_SHARED_CACHE_SIZE_HALF)) as *mut usize;
-        let rep_movsb_stop_ptr = (base.wrapping_add(LIBC_REP_MOVSB_STOP_THRESHOLD)) as *mut usize;
-        let memset_non_temporal_ptr =
-            (base.wrapping_add(LIBC_MEMSET_NON_TEMPORAL_THRESHOLD)) as *mut usize;
-        let shared_non_temporal_ptr =
-            (base.wrapping_add(LIBC_SHARED_NON_TEMPORAL_THRESHOLD)) as *mut usize;
-
-        apply_libc_copy_threshold_patch_raw(
-            rep_stosb_ptr,
-            rep_movsb_ptr,
-            shared_cache_size_ptr,
-            shared_cache_half_ptr,
-            rep_movsb_stop_ptr,
-            memset_non_temporal_ptr,
-            shared_non_temporal_ptr,
-        );
-        return;
     }
 
-    if let Some(symbol_offsets) = load_libc_copy_threshold_offsets_from_symtab(libc_path) {
+    // Next try the split debug file (.build-id) if installed. This keeps the
+    // offsets resilient across libc updates on stripped distributions.
+    if let Some(debug_offsets) = load_libc_copy_threshold_offsets_from_debug_file(libc_path) {
+        if libc_thresholds_offsets_fit_object_map(linker, idx, base, &debug_offsets) {
+            #[cfg(debug_assertions)]
+            {
+                use crate::libc::fs::write;
+                write::write_str(write::STD_ERR, "loader: libc thresholds via debug symbols ");
+                write::write_str(write::STD_ERR, libc_path);
+                write::write_str(write::STD_ERR, "\n");
+            }
+            apply_libc_copy_threshold_patch(base, &debug_offsets);
+            return;
+        }
         #[cfg(debug_assertions)]
         {
             use crate::libc::fs::write;
-            write::write_str(write::STD_ERR, "loader: libc thresholds via symtab ");
+            write::write_str(
+                write::STD_ERR,
+                "loader: debug-derived libc thresholds out of map; ignoring\n",
+            );
+        }
+    }
+
+    // Last automatic fallback: known build-id specific layouts.
+    if let Some(buildid_offsets) = load_libc_copy_threshold_offsets_from_known_build_id(libc_path) {
+        if libc_thresholds_offsets_fit_object_map(linker, idx, base, &buildid_offsets) {
+            #[cfg(debug_assertions)]
+            {
+                use crate::libc::fs::write;
+                write::write_str(write::STD_ERR, "loader: libc thresholds via known build-id ");
+                write::write_str(write::STD_ERR, libc_path);
+                write::write_str(write::STD_ERR, "\n");
+            }
+            apply_libc_copy_threshold_patch(base, &buildid_offsets);
+            return;
+        }
+        #[cfg(debug_assertions)]
+        {
+            use crate::libc::fs::write;
+            write::write_str(
+                write::STD_ERR,
+                "loader: build-id libc thresholds out of map; ignoring\n",
+            );
+        }
+    }
+
+    let fixed_fallback_forced = allow_fixed_libc_thresholds_fallback();
+
+    // Fixed offsets are intentionally opt-in only.
+    if fixed_fallback_forced {
+        let legacy_offsets = LibcCopyThresholdOffsets {
+            rep_stosb: LEGACY_REP_STOSB_THRESHOLD,
+            rep_movsb: LEGACY_REP_MOVSB_THRESHOLD,
+            shared_cache_size: LEGACY_SHARED_CACHE_SIZE,
+            shared_cache_half: LEGACY_SHARED_CACHE_SIZE_HALF,
+            rep_movsb_stop: LEGACY_REP_MOVSB_STOP_THRESHOLD,
+            memset_non_temporal: Some(LEGACY_MEMSET_NON_TEMPORAL_THRESHOLD),
+            shared_non_temporal: LEGACY_SHARED_NON_TEMPORAL_THRESHOLD,
+        };
+
+        if !libc_thresholds_offsets_fit_object_map(linker, idx, base, &legacy_offsets) {
+            #[cfg(debug_assertions)]
+            {
+                use crate::libc::fs::write;
+                write::write_str(
+                    write::STD_ERR,
+                    "loader: libc thresholds fixed offsets out of map; skipping\n",
+                );
+            }
+            return;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            use crate::libc::fs::write;
+            write::write_str(write::STD_ERR, "loader: libc thresholds via forced fixed offsets ");
             write::write_str(write::STD_ERR, libc_path);
             write::write_str(write::STD_ERR, "\n");
         }
-        apply_libc_copy_threshold_patch(base, &symbol_offsets);
+        apply_libc_copy_threshold_patch(base, &legacy_offsets);
         return;
     }
 
@@ -1005,9 +1043,15 @@ unsafe fn patch_libc_copy_thresholds(linker: &DynamicLinker) {
         use crate::libc::fs::write;
         write::write_str(
             write::STD_ERR,
-            "loader: libc thresholds fixed-offset fallback disabled for this libc path\n",
+            "loader: libc thresholds unavailable (no symtab/debug/known build-id)\n",
         );
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn allow_fixed_libc_thresholds_fallback() -> bool {
+    false
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1018,8 +1062,18 @@ struct LibcCopyThresholdOffsets {
     shared_cache_size: usize,
     shared_cache_half: usize,
     rep_movsb_stop: usize,
-    memset_non_temporal: usize,
+    // Some newer glibc builds no longer expose this internal symbol in symtab.
+    memset_non_temporal: Option<usize>,
     shared_non_temporal: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64NoteHeader {
+    n_namesz: u32,
+    n_descsz: u32,
+    n_type: u32,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1057,7 +1111,7 @@ fn libc_thresholds_offsets_complete(
     shared_cache_size: Option<usize>,
     shared_cache_half: Option<usize>,
     rep_movsb_stop: Option<usize>,
-    memset_non_temporal: Option<usize>,
+    _memset_non_temporal: Option<usize>,
     shared_non_temporal: Option<usize>,
 ) -> bool {
     rep_stosb.is_some()
@@ -1065,7 +1119,6 @@ fn libc_thresholds_offsets_complete(
         && shared_cache_size.is_some()
         && shared_cache_half.is_some()
         && rep_movsb_stop.is_some()
-        && memset_non_temporal.is_some()
         && shared_non_temporal.is_some()
 }
 
@@ -1087,14 +1140,22 @@ fn parse_libc_thresholds_cache_line(line: &str) -> Option<LibcCopyThresholdOffse
     let mut parts = line.split_whitespace();
     let mut next_hex = || usize::from_str_radix(parts.next()?, 16).ok();
 
+    let rep_stosb = next_hex()?;
+    let rep_movsb = next_hex()?;
+    let shared_cache_size = next_hex()?;
+    let shared_cache_half = next_hex()?;
+    let rep_movsb_stop = next_hex()?;
+    let memset_raw = next_hex()?;
+    let shared_non_temporal = next_hex()?;
+
     let offsets = LibcCopyThresholdOffsets {
-        rep_stosb: next_hex()?,
-        rep_movsb: next_hex()?,
-        shared_cache_size: next_hex()?,
-        shared_cache_half: next_hex()?,
-        rep_movsb_stop: next_hex()?,
-        memset_non_temporal: next_hex()?,
-        shared_non_temporal: next_hex()?,
+        rep_stosb,
+        rep_movsb,
+        shared_cache_size,
+        shared_cache_half,
+        rep_movsb_stop,
+        memset_non_temporal: if memset_raw == 0 { None } else { Some(memset_raw) },
+        shared_non_temporal,
     };
     Some(offsets)
 }
@@ -1116,6 +1177,7 @@ fn store_libc_thresholds_offsets_cache(path: &str, offsets: &LibcCopyThresholdOf
     #[cfg(target_family = "unix")]
     {
         if let Some(cache_path) = libc_thresholds_cache_path(path) {
+            let memset_non_temporal = offsets.memset_non_temporal.unwrap_or(0);
             let payload = format!(
                 "{:x} {:x} {:x} {:x} {:x} {:x} {:x}\n",
                 offsets.rep_stosb,
@@ -1123,7 +1185,7 @@ fn store_libc_thresholds_offsets_cache(path: &str, offsets: &LibcCopyThresholdOf
                 offsets.shared_cache_size,
                 offsets.shared_cache_half,
                 offsets.rep_movsb_stop,
-                offsets.memset_non_temporal,
+                memset_non_temporal,
                 offsets.shared_non_temporal
             );
             let _ = fs::write(cache_path, payload);
@@ -1132,7 +1194,227 @@ fn store_libc_thresholds_offsets_cache(path: &str, offsets: &LibcCopyThresholdOf
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn load_libc_copy_threshold_offsets_from_symtab(path: &str) -> Option<LibcCopyThresholdOffsets> {
+#[inline(always)]
+fn align_up_4(value: usize) -> usize {
+    (value + 3) & !3
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_build_id_from_note_block(note_bytes: &[u8]) -> Option<Vec<u8>> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let mut cursor = 0usize;
+
+    while cursor + size_of::<Elf64NoteHeader>() <= note_bytes.len() {
+        let hdr = unsafe {
+            core::ptr::read_unaligned(note_bytes.as_ptr().add(cursor).cast::<Elf64NoteHeader>())
+        };
+        cursor += size_of::<Elf64NoteHeader>();
+
+        let namesz = hdr.n_namesz as usize;
+        let descsz = hdr.n_descsz as usize;
+
+        let name_end = cursor.checked_add(namesz)?;
+        if name_end > note_bytes.len() {
+            break;
+        }
+        let name = &note_bytes[cursor..name_end];
+        cursor = align_up_4(name_end);
+        if cursor > note_bytes.len() {
+            break;
+        }
+
+        let desc_end = cursor.checked_add(descsz)?;
+        if desc_end > note_bytes.len() {
+            break;
+        }
+        let desc = &note_bytes[cursor..desc_end];
+        cursor = align_up_4(desc_end);
+        if cursor > note_bytes.len() {
+            break;
+        }
+
+        let is_gnu_name = name == b"GNU\0" || name == b"GNU";
+        if hdr.n_type == NT_GNU_BUILD_ID && is_gnu_name && !desc.is_empty() {
+            return Some(desc.to_vec());
+        }
+    }
+
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn load_elf_build_id(path: &str) -> Option<Vec<u8>> {
+    const SHT_NOTE: u32 = 7;
+
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < size_of::<ElfHeader>() {
+        return None;
+    }
+
+    let header: ElfHeader = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<ElfHeader>()) };
+    if header.e_ident[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+    if header.e_ident[4] != 2 || header.e_ident[5] != 1 {
+        return None;
+    }
+    if header.e_shoff == 0 || header.e_shnum == 0 {
+        return None;
+    }
+
+    let shoff = header.e_shoff;
+    let shentsize = header.e_shentsize as usize;
+    let shnum = header.e_shnum as usize;
+    if shentsize < size_of::<Elf64SectionHeader>() {
+        return None;
+    }
+
+    let read_shdr = |index: usize| -> Option<Elf64SectionHeader> {
+        if index >= shnum {
+            return None;
+        }
+        let off = shoff.checked_add(index.checked_mul(shentsize)?)?;
+        let end = off.checked_add(size_of::<Elf64SectionHeader>())?;
+        if end > bytes.len() {
+            return None;
+        }
+        Some(unsafe {
+            core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64SectionHeader>())
+        })
+    };
+
+    for sec_idx in 0..shnum {
+        let shdr = read_shdr(sec_idx)?;
+        if shdr.sh_type != SHT_NOTE {
+            continue;
+        }
+
+        let start = shdr.sh_offset as usize;
+        let len = shdr.sh_size as usize;
+        let end = start.checked_add(len)?;
+        if end > bytes.len() {
+            continue;
+        }
+        if let Some(build_id) = parse_build_id_from_note_block(&bytes[start..end]) {
+            return Some(build_id);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn debug_symbol_path_for_build_id(build_id: &[u8]) -> Option<String> {
+    if build_id.len() < 2 {
+        return None;
+    }
+
+    let mut first = String::with_capacity(2);
+    use core::fmt::Write as _;
+    let _ = write!(&mut first, "{:02x}", build_id[0]);
+
+    let mut rest = String::with_capacity((build_id.len() - 1) * 2);
+    for byte in build_id.iter().skip(1) {
+        let _ = write!(&mut rest, "{:02x}", byte);
+    }
+
+    Some(format!("/usr/lib/debug/.build-id/{first}/{rest}.debug"))
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn load_libc_copy_threshold_offsets_from_debug_file(
+    libc_path: &str,
+) -> Option<LibcCopyThresholdOffsets> {
+    let build_id = load_elf_build_id(libc_path)?;
+    let debug_path = debug_symbol_path_for_build_id(&build_id)?;
+    if !Path::new(&debug_path).exists() {
+        return None;
+    }
+
+    load_libc_copy_threshold_offsets_from_symtab(&debug_path)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn known_libc_threshold_offsets_for_build_id(build_id: &[u8]) -> Option<LibcCopyThresholdOffsets> {
+    // Fedora/RHEL-like glibc layout used by the legacy fixed offsets.
+    const BUILD_ID_LEGACY: [u8; 20] = [
+        0xff, 0x02, 0x67, 0x46, 0x5b, 0xc3, 0xd7, 0x6e, 0x21, 0x00, 0x3b, 0x3b, 0xc5, 0x59,
+        0x8f, 0xd5, 0xee, 0x63, 0xe2, 0x61,
+    ];
+    // Ubuntu/Debian glibc 2.39 stripped libc layout.
+    const BUILD_ID_UBUNTU_239: [u8; 20] = [
+        0x8e, 0x9f, 0xd8, 0x27, 0x44, 0x6c, 0x24, 0x06, 0x75, 0x41, 0xac, 0x53, 0x90, 0xe6,
+        0xf5, 0x27, 0xfb, 0x59, 0x47, 0xbb,
+    ];
+
+    if build_id == BUILD_ID_LEGACY {
+        return Some(LibcCopyThresholdOffsets {
+            rep_stosb: 0x1e9210,
+            rep_movsb: 0x1e9218,
+            shared_cache_size: 0x1e9220,
+            shared_cache_half: 0x1e9228,
+            rep_movsb_stop: 0x1f02c8,
+            memset_non_temporal: Some(0x1f02d0),
+            shared_non_temporal: 0x1f02d8,
+        });
+    }
+
+    if build_id == BUILD_ID_UBUNTU_239 {
+        return Some(LibcCopyThresholdOffsets {
+            rep_stosb: 0x203210,
+            rep_movsb: 0x203218,
+            shared_cache_size: 0x203220,
+            shared_cache_half: 0x203228,
+            rep_movsb_stop: 0x20a228,
+            memset_non_temporal: None,
+            shared_non_temporal: 0x20a230,
+        });
+    }
+
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn load_libc_copy_threshold_offsets_from_known_build_id(
+    libc_path: &str,
+) -> Option<LibcCopyThresholdOffsets> {
+    let build_id = load_elf_build_id(libc_path)?;
+    known_libc_threshold_offsets_for_build_id(&build_id)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn libc_thresholds_offsets_max(offsets: &LibcCopyThresholdOffsets) -> usize {
+    let mut max_offset = offsets
+        .rep_stosb
+        .max(offsets.rep_movsb)
+        .max(offsets.shared_cache_size)
+        .max(offsets.shared_cache_half)
+        .max(offsets.rep_movsb_stop)
+        .max(offsets.shared_non_temporal);
+    if let Some(memset_non_temporal) = offsets.memset_non_temporal {
+        max_offset = max_offset.max(memset_non_temporal);
+    }
+    max_offset
+}
+
+#[cfg(target_arch = "x86_64")]
+fn libc_thresholds_offsets_fit_object_map(
+    linker: &DynamicLinker,
+    idx: usize,
+    base: usize,
+    offsets: &LibcCopyThresholdOffsets,
+) -> bool {
+    let Some((map_start, map_end)) = linker.object_map_range(idx) else {
+        return true;
+    };
+    let max_addr = base.wrapping_add(libc_thresholds_offsets_max(offsets).saturating_add(size_of::<usize>()));
+    max_addr >= map_start && max_addr <= map_end
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn load_libc_copy_threshold_offsets_from_symtab(
+    path: &str,
+) -> Option<LibcCopyThresholdOffsets> {
     const SHT_SYMTAB: u32 = 2;
 
     if let Some(cached) = load_libc_thresholds_offsets_from_cache(path) {
@@ -1179,7 +1461,9 @@ unsafe fn load_libc_copy_threshold_offsets_from_symtab(path: &str) -> Option<Lib
         if end > bytes.len() {
             return None;
         }
-        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64SectionHeader>()) })
+        Some(unsafe {
+            core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64SectionHeader>())
+        })
     };
 
     for sec_idx in 0..shnum {
@@ -1271,7 +1555,7 @@ unsafe fn load_libc_copy_threshold_offsets_from_symtab(path: &str) -> Option<Lib
         shared_cache_size: shared_cache_size?,
         shared_cache_half: shared_cache_half?,
         rep_movsb_stop: rep_movsb_stop?,
-        memset_non_temporal: memset_non_temporal?,
+        memset_non_temporal,
         shared_non_temporal: shared_non_temporal?,
     };
 
@@ -1286,7 +1570,9 @@ unsafe fn apply_libc_copy_threshold_patch(base: usize, offsets: &LibcCopyThresho
     let shared_cache_size_ptr = (base.wrapping_add(offsets.shared_cache_size)) as *mut usize;
     let shared_cache_half_ptr = (base.wrapping_add(offsets.shared_cache_half)) as *mut usize;
     let rep_movsb_stop_ptr = (base.wrapping_add(offsets.rep_movsb_stop)) as *mut usize;
-    let memset_non_temporal_ptr = (base.wrapping_add(offsets.memset_non_temporal)) as *mut usize;
+    let memset_non_temporal_ptr = offsets
+        .memset_non_temporal
+        .map(|off| (base.wrapping_add(off)) as *mut usize);
     let shared_non_temporal_ptr = (base.wrapping_add(offsets.shared_non_temporal)) as *mut usize;
 
     apply_libc_copy_threshold_patch_raw(
@@ -1307,10 +1593,9 @@ unsafe fn apply_libc_copy_threshold_patch_raw(
     shared_cache_size_ptr: *mut usize,
     shared_cache_half_ptr: *mut usize,
     rep_movsb_stop_ptr: *mut usize,
-    memset_non_temporal_ptr: *mut usize,
+    memset_non_temporal_ptr: Option<*mut usize>,
     shared_non_temporal_ptr: *mut usize,
 ) {
-
     let mut shared_cache_size = core::ptr::read_volatile(shared_cache_size_ptr);
     if shared_cache_size < 4096 || shared_cache_size > (1usize << 34) {
         // Conservative fallback if cache probing did not run.
@@ -1325,7 +1610,9 @@ unsafe fn apply_libc_copy_threshold_patch_raw(
     core::ptr::write_volatile(rep_stosb_ptr, REP_THRESHOLD);
     core::ptr::write_volatile(rep_movsb_ptr, REP_THRESHOLD);
     core::ptr::write_volatile(rep_movsb_stop_ptr, usize::MAX);
-    core::ptr::write_volatile(memset_non_temporal_ptr, usize::MAX);
+    if let Some(memset_non_temporal_ptr) = memset_non_temporal_ptr {
+        core::ptr::write_volatile(memset_non_temporal_ptr, usize::MAX);
+    }
     core::ptr::write_volatile(shared_non_temporal_ptr, usize::MAX);
     core::ptr::write_volatile(shared_cache_size_ptr, shared_cache_size);
     core::ptr::write_volatile(shared_cache_half_ptr, shared_cache_half);
@@ -1406,6 +1693,29 @@ unsafe fn set_auxv_val_in_place(auxv_pointer: *mut AuxiliaryVectorItem, key: usi
     }
 }
 
+#[inline(always)]
+fn sanitize_hwcap_for_target(image: &LoadedImage, hwcap: usize, hwcap2: usize) -> (usize, usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let is_x86_glibc_dynamic = image.has_dynamic
+            && image
+                .interpreter_path
+                .as_deref()
+                .is_some_and(|path| interpreter_name(path).starts_with("ld-linux"));
+        if is_x86_glibc_dynamic && !preserve_x86_glibc_hwcap() {
+            return (0, 0);
+        }
+    }
+
+    (hwcap, hwcap2)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn preserve_x86_glibc_hwcap() -> bool {
+    false
+}
+
 fn interpreter_name(interpreter_path: &str) -> &str {
     interpreter_path
         .rsplit('/')
@@ -1466,8 +1776,7 @@ unsafe fn enable_musl_threading_fastpath(linker: &DynamicLinker) {
     while i + 7 <= bytes.len() {
         // cmp byte ptr [rip+disp32], 0
         if bytes[i] == 0x80 && bytes[i + 1] == 0x3d && bytes[i + 6] == 0x00 {
-            let disp =
-                i32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
+            let disp = i32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
             let target = (func.wrapping_add(i).wrapping_add(7) as isize).wrapping_add(disp as isize)
                 as *mut u8;
             if !target.is_null() {
@@ -1542,8 +1851,7 @@ unsafe fn derive_musl_stage2b_slots(dls2b_addr: usize) -> MuslStage2bSlots {
             && code[i + 8] == 0xe8
         {
             let disp1 = i32::from_le_bytes([code[i + 1], code[i + 2], code[i + 3], code[i + 4]]);
-            let disp2 =
-                i32::from_le_bytes([code[i + 9], code[i + 10], code[i + 11], code[i + 12]]);
+            let disp2 = i32::from_le_bytes([code[i + 9], code[i + 10], code[i + 11], code[i + 12]]);
             slots.stage2b_fn1 = Some(rip_target(dls2b_addr + i, 5, disp1));
             slots.stage2b_fn2 = Some(rip_target(dls2b_addr + i + 8, 5, disp2));
             slots.stage2b_init_arg = last_lea_rdi_rip;
@@ -2119,17 +2427,17 @@ unsafe fn seed_musl_stage2b_runtime_state(
     let mut stage2_runtime_seeded = false;
     #[cfg(target_arch = "x86_64")]
     {
-        if let (Some(init_arg), Some(init_fn1), Some(init_fn2)) =
-            (derived.stage2b_init_arg, derived.stage2b_fn1, derived.stage2b_fn2)
-        {
+        if let (Some(init_arg), Some(init_fn1), Some(init_fn2)) = (
+            derived.stage2b_init_arg,
+            derived.stage2b_fn1,
+            derived.stage2b_fn2,
+        ) {
             let state_ptr = {
-                let init: unsafe extern "C" fn(*mut u8) -> *mut u8 =
-                    core::mem::transmute(init_fn1);
+                let init: unsafe extern "C" fn(*mut u8) -> *mut u8 = core::mem::transmute(init_fn1);
                 init(init_arg as *mut u8)
             };
             if !state_ptr.is_null() {
-                let finalize: unsafe extern "C" fn(*mut u8) -> i32 =
-                    core::mem::transmute(init_fn2);
+                let finalize: unsafe extern "C" fn(*mut u8) -> i32 = core::mem::transmute(init_fn2);
                 let _ = finalize(state_ptr);
                 stage2_runtime_seeded = true;
             }
@@ -2216,9 +2524,11 @@ unsafe fn seed_musl_stage2b_runtime_state(
         core::ptr::write_volatile(hwcap_slot as *mut usize, hwcap);
     }
 
-    if let (Some(init_arg), Some(init_fn1), Some(init_fn2)) =
-        (derived.stage2b_init_arg, derived.stage2b_fn1, derived.stage2b_fn2)
-    {
+    if let (Some(init_arg), Some(init_fn1), Some(init_fn2)) = (
+        derived.stage2b_init_arg,
+        derived.stage2b_fn1,
+        derived.stage2b_fn2,
+    ) {
         let state_ptr = {
             let init: unsafe extern "C" fn(*mut u8) -> *mut u8 = core::mem::transmute(init_fn1);
             init(init_arg as *mut u8)
@@ -2313,41 +2623,6 @@ fn parse_interp_path_from_bytes(
     Some(path.to_string())
 }
 
-unsafe fn parse_interp_path_from_fd(fd: i32, program_headers: &[ProgramHeader]) -> Option<String> {
-    let interp = program_headers.iter().find(|ph| ph.p_type == PT_INTERP)?;
-    if interp.p_filesz == 0 {
-        return None;
-    }
-    let mut bytes = vec![0u8; interp.p_filesz];
-    pread_exact(fd, &mut bytes, interp.p_offset);
-    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    if nul == 0 {
-        return None;
-    }
-    let path = core::str::from_utf8(&bytes[..nul]).ok()?;
-    Some(path.to_string())
-}
-
-fn maybe_force_c_locale(env: &mut Vec<*const u8>) {
-    // Avoid locale initialization hangs by defaulting to C locale when
-    // LC_ALL is unset and LANG is non-C.
-    static mut LC_ALL_C: [u8; 9] = *b"LC_ALL=C\0";
-    const LC_ALL_KEY: &[u8] = b"LC_ALL=";
-    const LANG_KEY: &[u8] = b"LANG=";
-
-    if env_find_key(env, LC_ALL_KEY).is_some() {
-        return;
-    }
-
-    if let Some(lang) = env_find_key(env, LANG_KEY) {
-        if lang == b"C" || lang == b"POSIX" {
-            return;
-        }
-    }
-
-    env.push(core::ptr::addr_of_mut!(LC_ALL_C).cast::<u8>() as *const u8);
-}
-
 fn maybe_disable_glibc_rseq_under_valgrind(env: &mut Vec<*const u8>) {
     if !running_under_valgrind() {
         return;
@@ -2369,19 +2644,6 @@ fn maybe_disable_glibc_rseq_under_valgrind(env: &mut Vec<*const u8>) {
     }
 
     env.push(tunables_ptr);
-}
-
-fn env_find_key<'a>(env: &'a [*const u8], key: &[u8]) -> Option<&'a [u8]> {
-    for &ptr in env.iter() {
-        if ptr.is_null() {
-            continue;
-        }
-        let bytes = unsafe { CStr::from_ptr(ptr.cast::<c_char>()).to_bytes() };
-        if bytes.starts_with(key) {
-            return Some(&bytes[key.len()..]);
-        }
-    }
-    None
 }
 
 #[cfg(debug_assertions)]
@@ -2429,87 +2691,6 @@ unsafe fn trace_rpc_vars_slot(stage: &str) {
     write::write_str(write::STD_ERR, " value=");
     write_hex(write::STD_ERR, slot);
     write::write_str(write::STD_ERR, "\n");
-}
-
-fn cstr_ptr_to_string(ptr: *const u8) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    let text = unsafe { CStr::from_ptr(ptr.cast::<c_char>()) }
-        .to_string_lossy()
-        .into_owned();
-    Some(text)
-}
-
-fn setup_jpackage_layout_compat(target_exec_path: Option<&str>) {
-    let Some(target_exec_path) = target_exec_path else {
-        return;
-    };
-
-    let Ok(self_exe) = fs::read_link("/proc/self/exe") else {
-        return;
-    };
-    let Some(self_name) = self_exe.file_name().and_then(|name| name.to_str()) else {
-        return;
-    };
-    let Some(self_bin_dir) = self_exe.parent() else {
-        return;
-    };
-
-    let target_exec = Path::new(target_exec_path);
-    let Some(target_name) = target_exec.file_name().and_then(|name| name.to_str()) else {
-        return;
-    };
-    let Some(target_bin_dir) = target_exec.parent() else {
-        return;
-    };
-
-    let Some(self_root_dir) = self_bin_dir.parent() else {
-        return;
-    };
-    let Some(target_root_dir) = target_bin_dir.parent() else {
-        return;
-    };
-    let self_lib_dir = self_root_dir.join("lib");
-    let target_lib_dir = target_root_dir.join("lib");
-    if self_lib_dir == target_lib_dir {
-        return;
-    }
-
-    let target_cfg = target_lib_dir.join("app").join(format!("{}.cfg", target_name));
-    if !target_cfg.exists() {
-        return;
-    }
-
-    for leaf in ["runtime", "app"] {
-        let src = target_lib_dir.join(leaf);
-        let dst = self_lib_dir.join(leaf);
-        if !src.exists() || dst.exists() {
-            continue;
-        }
-        if let Some(parent) = dst.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        #[cfg(unix)]
-        {
-            let _ = std::os::unix::fs::symlink(&src, &dst);
-        }
-    }
-
-    let self_cfg = self_lib_dir.join("app").join(format!("{}.cfg", self_name));
-    if self_cfg.exists() {
-        return;
-    }
-    if let Some(parent) = self_cfg.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    #[cfg(unix)]
-    {
-        if std::os::unix::fs::symlink(&target_cfg, &self_cfg).is_ok() {
-            return;
-        }
-    }
-    let _ = fs::copy(target_cfg, self_cfg);
 }
 
 #[inline(always)]
@@ -2780,155 +2961,6 @@ unsafe fn load_target_image_from_bytes(elf_bytes: &[u8]) -> LoadedImage {
     }
 }
 
-#[inline(always)]
-unsafe fn load_target_image(path: *const u8) -> LoadedImage {
-    let fd = openat_readonly(path);
-    if fd < 0 {
-        use crate::libc::fs::write;
-        write::write_str(write::STD_ERR, "Error: could not open target binary\n");
-        exit::exit(1);
-    }
-
-    // Read ELF Header
-    let mut uninit_header: MaybeUninit<ElfHeader> = MaybeUninit::uninit();
-    let header_bytes = slice::from_raw_parts_mut(
-        uninit_header.as_mut_ptr() as *mut u8,
-        size_of::<ElfHeader>(),
-    );
-    pread_exact(fd, header_bytes, 0);
-    let header = uninit_header.assume_init();
-
-    if header.e_ident[0..4] != [0x7f, b'E', b'L', b'F'] {
-        use crate::libc::fs::write;
-        write::write_str(
-            write::STD_ERR,
-            "Error: target is not an ELF binary (script/shebang not supported)\n",
-        );
-        exit::exit(1);
-    }
-
-    if header.e_phentsize as usize != size_of::<ProgramHeader>() {
-        use crate::libc::fs::write;
-        write::write_str(write::STD_ERR, "Error: unsupported program header size\n");
-        exit::exit(1);
-    }
-
-    // Read Program Headers
-    let mut program_headers: Vec<ProgramHeader> = Vec::with_capacity(header.e_phnum as usize);
-    let ph_bytes = slice::from_raw_parts_mut(
-        program_headers.as_mut_ptr() as *mut u8,
-        header.e_phnum as usize * size_of::<ProgramHeader>(),
-    );
-    pread_exact(fd, ph_bytes, header.e_phoff);
-    program_headers.set_len(header.e_phnum as usize);
-
-    let interpreter_path = parse_interp_path_from_fd(fd, &program_headers);
-    let (min_addr, max_addr) = calculate_virtual_address_bounds(&program_headers);
-
-    let mmap_base = match header.e_type {
-        ET_DYN => mmap(
-            null_mut(),
-            max_addr - min_addr,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        ) as usize,
-        ET_EXEC => mmap(
-            min_addr as *mut u8,
-            max_addr - min_addr,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-            -1,
-            0,
-        ) as usize,
-        _ => {
-            use crate::libc::fs::write;
-            write::write_str(write::STD_ERR, "Error: unsupported ELF type\n");
-            exit::exit(1);
-        }
-    };
-
-    let base = if header.e_type == ET_DYN {
-        mmap_base.wrapping_sub(min_addr)
-    } else {
-        0
-    };
-
-    for header in &program_headers {
-        if header.p_type != PT_LOAD {
-            continue;
-        }
-
-        let dest = (base.wrapping_add(header.p_vaddr)) as *mut u8;
-        if header.p_filesz > 0 {
-            let segment = slice::from_raw_parts_mut(dest, header.p_filesz);
-            pread_exact(fd, segment, header.p_offset);
-        }
-        if header.p_memsz > header.p_filesz {
-            let bss_start = dest.add(header.p_filesz);
-            let bss_size = header.p_memsz - header.p_filesz;
-            core::ptr::write_bytes(bss_start, 0, bss_size);
-        }
-    }
-
-    let mut exec_dynamic = null();
-    for header in &program_headers {
-        if header.p_type == PT_DYNAMIC {
-            exec_dynamic = (base.wrapping_add(header.p_vaddr)) as *const u8;
-            break;
-        }
-    }
-
-    // Prefer PT_PHDR when present, otherwise derive the in-memory PHDR address
-    // from the PT_LOAD segment that contains e_phoff.
-    let mut phdr_ptr: *const ProgramHeader = null();
-    for ph in &program_headers {
-        if ph.p_type == PT_PHDR {
-            phdr_ptr = (base.wrapping_add(ph.p_vaddr)) as *const ProgramHeader;
-            break;
-        }
-    }
-    if phdr_ptr.is_null() {
-        for ph in &program_headers {
-            if ph.p_type != PT_LOAD {
-                continue;
-            }
-            let seg_start = ph.p_offset;
-            let seg_end = ph.p_offset.wrapping_add(ph.p_filesz);
-            if header.e_phoff >= seg_start && header.e_phoff < seg_end {
-                let delta = header.e_phoff.wrapping_sub(ph.p_offset);
-                phdr_ptr =
-                    (base.wrapping_add(ph.p_vaddr).wrapping_add(delta)) as *const ProgramHeader;
-                break;
-            }
-        }
-    }
-    if phdr_ptr.is_null() {
-        use crate::libc::fs::write;
-        write::write_str(
-            write::STD_ERR,
-            "Error: could not resolve in-memory program header table\n",
-        );
-        exit::exit(1);
-    }
-
-    let entry = base.wrapping_add(header.e_entry);
-    close_fd(fd);
-
-    LoadedImage {
-        base,
-        entry,
-        phdr: phdr_ptr,
-        phnum: header.e_phnum as usize,
-        phent: header.e_phentsize as usize,
-        exec_dynamic,
-        program_headers,
-        has_dynamic: !exec_dynamic.is_null(),
-        interpreter_path,
-    }
-}
-
 unsafe fn calculate_virtual_address_bounds(
     program_header_table: &[ProgramHeader],
 ) -> (usize, usize) {
@@ -2951,24 +2983,6 @@ unsafe fn calculate_virtual_address_bounds(
         page_size::get_page_start(min_addr),
         page_size::get_page_end(max_addr),
     )
-}
-
-unsafe fn openat_readonly(path: *const u8) -> i32 {
-    arch::openat_readonly(path.cast::<c_char>())
-}
-
-unsafe fn close_fd(fd: i32) {
-    arch::close_fd(fd);
-}
-
-unsafe fn pread_exact(fd: i32, buf: &mut [u8], offset: usize) {
-    let result = arch::pread(fd, buf.as_mut_ptr(), buf.len(), offset);
-
-    if result != buf.len() as isize {
-        use crate::libc::fs::write;
-        write::write_str(write::STD_ERR, "Error: could not read from file\n");
-        exit::exit(1);
-    }
 }
 
 unsafe fn write_hex(fd: i32, mut value: usize) {

@@ -8,7 +8,7 @@ fn main() {
 
         if argv_storage.len() < 2 {
             eprintln!(
-                "Usage: rustld [--entry-symbol <name> | --entry-addr <addr>] <program> [args...]"
+                "Usage: rustld [--verbose|-v] [--entry-symbol <name> | --entry-addr <addr>] <program> [args...]"
             );
             std::process::exit(1);
         }
@@ -18,9 +18,14 @@ fn main() {
 
         let mut entry_symbol: Option<String> = None;
         let mut entry_address: Option<usize> = None;
+        let mut verbose = false;
         let mut target_argv: Vec<String> = Vec::new();
 
         while let Some(arg) = args.next() {
+            if arg == "--verbose" || arg == "-v" {
+                verbose = true;
+                continue;
+            }
             if arg == "--entry-symbol" {
                 let Some(symbol) = args.next() else {
                     eprintln!("Error: --entry-symbol expects a value");
@@ -65,10 +70,16 @@ fn main() {
                 entry_address,
                 None,
                 None,
-                false,
+                verbose,
             );
         } else {
-            ElfLoader::new_with_obf(false).execute_from_bytes(target_bytes, target_argv, None, None, false);
+            ElfLoader::new_with_obf(false).execute_from_bytes(
+                target_bytes,
+                target_argv,
+                None,
+                None,
+                verbose,
+            );
         }
     }
 }
