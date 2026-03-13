@@ -1,9 +1,9 @@
+use crate::syscall::trampoline::indirect_syscall6;
 use core::{
     arch::asm,
     ffi::{c_char, c_void},
 };
 use std::arch::naked_asm;
-use crate::syscall::trampoline::indirect_syscall6;
 
 #[inline(always)]
 pub(crate) unsafe fn current_stack_pointer() -> *const u8 {
@@ -53,26 +53,6 @@ pub(crate) unsafe fn write(fd: i32, buf: *const c_void, len: usize) -> isize {
 pub(crate) fn close(fd: i32) -> isize {
     const CLOSE: usize = 3;
     unsafe { indirect_syscall6(CLOSE, fd as usize, 0, 0, 0, 0, 0) }
-}
-
-#[inline(always)]
-pub(crate) unsafe fn execve(
-    path_ptr: *const c_char,
-    argv: *const *const c_char,
-    envp: *const *const c_char,
-) -> isize {
-    const EXECVE: usize = 59;
-    unsafe {
-        indirect_syscall6(
-            EXECVE,
-            path_ptr as usize,
-            argv as usize,
-            envp as usize,
-            0,
-            0,
-            0,
-        )
-    }
 }
 
 #[inline(always)]

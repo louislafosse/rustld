@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::{ffi::CStr, mem::MaybeUninit};
 
-use crate::{io_macros::syscall_debug_assert, start::environment_variables::EnvironmentIter};
+use crate::start::environment_variables::EnvironmentIter;
 
 #[allow(non_upper_case_globals)]
 static mut environ: MaybeUninit<*mut *mut u8> = MaybeUninit::uninit();
@@ -14,14 +14,6 @@ unsafe extern "C" {
 
 pub unsafe fn host_environment_pointer() -> *mut *mut u8 {
     core::ptr::read_volatile(core::ptr::addr_of!(host_environ)).cast()
-}
-
-pub unsafe fn set_environ_pointer(environ_pointer: *mut *mut u8) {
-    syscall_debug_assert!((*environ_pointer.sub(1)).is_null());
-
-    #[allow(static_mut_refs)]
-    environ.write(environ_pointer);
-    ENVIRON_INITIALIZED.store(true, Ordering::Release);
 }
 
 pub unsafe fn get_environ_pointer() -> *mut *mut u8 {

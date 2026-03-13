@@ -59,6 +59,7 @@ fn get_stub_symbol(name: &str) -> Option<usize> {
         "getcon" => || getcon as *const () as usize,
         "getfilecon" => || getfilecon as *const () as usize,
         "lgetfilecon" => || lgetfilecon as *const () as usize,
+        "fgetfilecon" => || fgetfilecon as *const () as usize,
         "getfilecon_raw" => || getfilecon_raw as *const () as usize,
     };
 
@@ -87,6 +88,7 @@ fn is_stub_preferred(name: &str) -> bool {
                 | "getcon"
                 | "getfilecon"
                 | "lgetfilecon"
+                | "fgetfilecon"
                 | "getfilecon_raw"
         )
 }

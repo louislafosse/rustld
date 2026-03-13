@@ -1,5 +1,5 @@
-use crate::io_macros::syscall_debug_assert;
 use super::trampoline::indirect_syscall6;
+use crate::io_macros::syscall_debug_assert;
 
 // Protection flags:
 pub const PROT_NONE: usize = 0x0;
@@ -27,7 +27,15 @@ pub unsafe fn mmap(
 ) -> *mut u8 {
     const MMAP: usize = 222;
     let result = unsafe {
-        indirect_syscall6(MMAP, pointer as usize, size, protection_flags, map_flags, file_descriptor as usize, file_offset)
+        indirect_syscall6(
+            MMAP,
+            pointer as usize,
+            size,
+            protection_flags,
+            map_flags,
+            file_descriptor as usize,
+            file_offset,
+        )
     };
     syscall_debug_assert!(result >= 0);
     result as *mut u8

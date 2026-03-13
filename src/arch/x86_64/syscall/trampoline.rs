@@ -59,7 +59,10 @@ pub fn init_trampoline() {
     }
     unsafe {
         let page = bootstrap_mmap(4096);
-        assert!(!page.is_null() && (page as isize) > 0, "rustld: trampoline mmap failed");
+        assert!(
+            !page.is_null() && (page as isize) > 0,
+            "rustld: trampoline mmap failed"
+        );
         core::ptr::copy_nonoverlapping(STUB.as_ptr(), page, STUB.len());
         bootstrap_mprotect(page, 4096, 0x1 | 0x4); // PROT_READ | PROT_EXEC
         let _ = TRAMPOLINE.compare_exchange(0, page as usize, Ordering::Release, Ordering::Relaxed);
@@ -69,13 +72,26 @@ pub fn init_trampoline() {
 #[inline(always)]
 pub fn trampoline() -> usize {
     let addr = TRAMPOLINE.load(Ordering::Acquire);
-    if addr == 0 { init_trampoline(); TRAMPOLINE.load(Ordering::Acquire) } else { addr }
+    if addr == 0 {
+        init_trampoline();
+        TRAMPOLINE.load(Ordering::Acquire)
+    } else {
+        addr
+    }
 }
 
 // `#[inline(never)]` keeps the `syscall` opcode confined to one copy in the
 // binary instead of being duplicated at every inlined call site.
 #[inline(never)]
-unsafe fn direct_syscall6(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> isize {
+unsafe fn direct_syscall6(
+    nr: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+) -> isize {
     let result: isize;
     unsafe {
         asm!(
@@ -98,7 +114,15 @@ unsafe fn direct_syscall_noreturn(nr: usize, a1: usize) -> ! {
 }
 
 #[inline(always)]
-pub unsafe fn indirect_syscall6(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> isize {
+pub unsafe fn indirect_syscall6(
+    nr: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+) -> isize {
     if USE_INDIRECT.load(Ordering::Relaxed) {
         let stub = trampoline();
         let result: isize;

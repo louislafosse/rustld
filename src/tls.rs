@@ -900,14 +900,6 @@ unsafe fn initialize_tls_block(
     Some(tcb)
 }
 
-#[allow(dead_code)]
-pub unsafe fn tls_state() -> Option<&'static TlsState> {
-    #[allow(static_mut_refs)]
-    {
-        TLS_STATE.as_ref()
-    }
-}
-
 pub unsafe fn tls_layout() -> Option<TlsLayout> {
     let _guard = lock_tls_state();
     TLS_LAYOUT

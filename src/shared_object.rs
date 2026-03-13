@@ -7,9 +7,9 @@ use std::mem::MaybeUninit;
 use std::ptr::null_mut;
 
 use crate::elf::dynamic_array::{
-    DynamicArrayItem, DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_HASH, DT_INIT,
-    DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_PLTRELSZ, DT_RELR, DT_RELRENT,
-    DT_RELRSZ, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRSZ, DT_VERSYM,
+    DynamicArrayItem, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL,
+    DT_NEEDED, DT_PLTRELSZ, DT_RELR, DT_RELRENT, DT_RELRSZ, DT_RPATH, DT_RUNPATH, DT_SONAME,
+    DT_STRSZ, DT_VERSYM,
 };
 use crate::elf::program_header::PT_LOAD;
 use crate::elf::relocate::{Relocatable, RelocationSlices};
@@ -20,7 +20,7 @@ use crate::{
     elf::{
         dynamic_array::{DynamicArrayIter, DT_RELA, DT_RELASZ, DT_STRTAB, DT_SYMTAB},
         header::ElfHeader,
-        program_header::{ProgramHeader, PT_DYNAMIC, PT_PHDR, PT_TLS},
+        program_header::{ProgramHeader, PT_DYNAMIC, PT_TLS},
         relocate::Rela,
         string_table::StringTable,
     },
@@ -392,7 +392,10 @@ impl SharedObject {
     }
 
     #[cold]
-    unsafe fn lookup_exported_symbol_linear_any_version(&self, symbol_name: &str) -> Option<Symbol> {
+    unsafe fn lookup_exported_symbol_linear_any_version(
+        &self,
+        symbol_name: &str,
+    ) -> Option<Symbol> {
         if self.symbol_table.as_ptr().is_null() || self.symbol_count == 0 {
             return None;
         }
@@ -439,7 +442,10 @@ impl SharedObject {
     }
 
     #[inline(always)]
-    unsafe fn lookup_exported_symbol_indexed_any_version(&self, symbol_name: &str) -> Option<Symbol> {
+    unsafe fn lookup_exported_symbol_indexed_any_version(
+        &self,
+        symbol_name: &str,
+    ) -> Option<Symbol> {
         if self.sysv_export_any_version_buckets.is_empty() || symbol_name.is_empty() {
             return None;
         }
@@ -586,52 +592,6 @@ impl SharedObject {
             ),
             None => Self::build_static(base_addr, tls, map_start, map_end, load_segments, eh_frame),
         }
-    }
-
-    pub unsafe fn from_headers(
-        program_header_table: &[ProgramHeader],
-        _pseudorandom_bytes: *const [u8; 16],
-    ) -> Self {
-        let (mut base_addr, mut dynamic_header, mut tls_program_header, mut eh_frame_header) =
-            (0usize, None, None, None);
-        for header in program_header_table {
-            match header.p_type {
-                PT_PHDR => {
-                    base_addr =
-                        (program_header_table.as_ptr() as usize).wrapping_sub(header.p_vaddr);
-                }
-                PT_DYNAMIC => {
-                    dynamic_header = Some(header);
-                }
-                PT_TLS => {
-                    tls_program_header = Some(header);
-                }
-                PT_GNU_EH_FRAME => {
-                    eh_frame_header = Some(header);
-                }
-                _ => (),
-            }
-        }
-        syscall_debug_assert!(dynamic_header.is_some());
-
-        let (min_addr, max_addr) = calculate_virtual_address_bounds(program_header_table);
-        let map_start = base_addr.wrapping_add(min_addr);
-        let map_end = base_addr.wrapping_add(max_addr);
-        let load_segments = collect_load_segment_ranges(base_addr, program_header_table);
-        let tls = tls_program_header.map(|header| TlsInfo::from_program_header(base_addr, header));
-        let eh_frame = eh_frame_header
-            .map(|header| (base_addr.wrapping_add(header.p_vaddr)) as *const u8)
-            .unwrap_or(null());
-
-        Self::build(
-            base_addr,
-            dynamic_header.unwrap_unchecked(),
-            tls,
-            map_start,
-            map_end,
-            load_segments,
-            eh_frame,
-        )
     }
 
     pub unsafe fn from_fd(fd: i32) -> Self {
@@ -781,8 +741,8 @@ impl SharedObject {
                             );
                             exit::exit(1);
                         }
-                        // Keep bss pages explicitly initialized so tools like
-                        // valgrind do not treat demand-zero pages as undefined.
+                        // Anonymous mappings are already zero-filled by kernel.
+                        #[cfg(debug_assertions)]
                         core::ptr::write_bytes(bss_map_addr, 0, bss_map_len);
                     } else if header.p_memsz > header.p_filesz {
                         let zero_start = base_addr + header.p_vaddr + header.p_filesz;
@@ -817,8 +777,8 @@ impl SharedObject {
                                 );
                                 exit::exit(1);
                             }
-                            // Keep bss pages explicitly initialized so tools like
-                            // valgrind do not treat demand-zero pages as undefined.
+                            // Anonymous mappings are already zero-filled by kernel.
+                            #[cfg(debug_assertions)]
                             core::ptr::write_bytes(anon_map_addr, 0, anon_map_len);
                         }
                     }
@@ -1234,54 +1194,6 @@ impl SharedObject {
                 ) = core::mem::transmute(func_addr);
                 func(arg_count, arg_pointer, env_pointer, auxv_pointer);
             }
-        }
-    }
-
-    pub unsafe fn call_fini_functions(&self) {
-        if self.dynamic.is_null() {
-            return;
-        }
-
-        let mut fini_fn: Option<usize> = None;
-        let mut fini_array_ptr: *const usize = null();
-        let mut fini_array_count = 0usize;
-
-        for item in DynamicArrayIter::new(self.dynamic) {
-            match item.d_tag {
-                DT_FINI => fini_fn = Some(item.d_un.d_ptr.addr()),
-                DT_FINI_ARRAY => {
-                    fini_array_ptr =
-                        (self.base.wrapping_add(item.d_un.d_ptr.addr())) as *const usize;
-                }
-                DT_FINI_ARRAYSZ => fini_array_count = item.d_un.d_val / size_of::<usize>(),
-                _ => (),
-            }
-        }
-
-        if !fini_array_ptr.is_null() && fini_array_count > 0 {
-            let fini_array_addr = fini_array_ptr as usize;
-            if fini_array_addr < self.map_start || fini_array_addr >= self.map_end {
-                return;
-            }
-            let max_entries = (self.map_end - fini_array_addr) / size_of::<usize>();
-            if max_entries == 0 {
-                return;
-            }
-            let fini_array_count = fini_array_count.min(max_entries);
-            let fini_array = slice::from_raw_parts(fini_array_ptr, fini_array_count);
-            for &func_addr in fini_array.iter().rev() {
-                if func_addr == 0 {
-                    continue;
-                }
-                let func: extern "C" fn() = core::mem::transmute(func_addr);
-                func();
-            }
-        }
-
-        if let Some(fini_offset) = fini_fn {
-            let addr = self.base.wrapping_add(fini_offset);
-            let func: extern "C" fn() = core::mem::transmute(addr);
-            func();
         }
     }
 }

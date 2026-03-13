@@ -190,9 +190,7 @@ fn link_map_info_index(tag: usize) -> Option<usize> {
 }
 
 unsafe fn populate_link_map_dynamic_info(map: *mut u8, dynamic: *const DynamicArrayItem) {
-    if dynamic.is_null()
-        || (dynamic as usize) % core::mem::align_of::<DynamicArrayItem>() != 0
-    {
+    if dynamic.is_null() || (dynamic as usize) % core::mem::align_of::<DynamicArrayItem>() != 0 {
         return;
     }
 
@@ -499,6 +497,7 @@ impl DynamicLinker {
                 "/lib64/ld-musl-x86_64.so.1",
                 "/usr/x86_64-linux-musl/lib/ld-musl-x86_64.so.1",
                 "/usr/x86_64-linux-musl/lib64/ld-musl-x86_64.so.1",
+                "/usr/lib/ld-musl-x86_64.so.1",
             ];
         }
 
@@ -509,11 +508,29 @@ impl DynamicLinker {
                 "/lib64/ld-musl-aarch64.so.1",
                 "/usr/aarch64-linux-musl/lib/ld-musl-aarch64.so.1",
                 "/usr/aarch64-linux-musl/lib64/ld-musl-aarch64.so.1",
+                "/usr/lib/ld-musl-aarch64.so.1",
             ];
         }
 
         #[allow(unreachable_code)]
         &[]
+    }
+
+    #[inline(always)]
+    fn is_system_bin_dir(dir: &str) -> bool {
+        matches!(dir, "/bin" | "/usr/bin" | "/sbin" | "/usr/sbin")
+    }
+
+    #[inline(always)]
+    fn is_shared_object_soname(name: &str) -> bool {
+        if name.contains('/') {
+            return false;
+        }
+        let base = name.rsplit('/').next().unwrap_or(name);
+        if base.starts_with("ld-linux") || base.starts_with("ld-musl") {
+            return true;
+        }
+        base.starts_with("lib") && base.contains(".so")
     }
 
     #[inline(always)]
@@ -737,24 +754,6 @@ impl DynamicLinker {
             visit(idx, start_idx, self, &mut state, &mut order);
         }
         order
-    }
-
-    pub unsafe fn call_fini_for_loaded_objects(&self) {
-        if self.objects.len() <= 1 {
-            return;
-        }
-        let skip_selinux_fini = skip_selinux_ctors();
-        let order = self.dependency_init_order(1);
-        for &idx in order.iter().rev() {
-            if skip_selinux_fini
-                && self.objects[idx]
-                    .soname_str()
-                    .is_some_and(|soname| soname == "libselinux.so.1")
-            {
-                continue;
-            }
-            self.objects[idx].call_fini_functions();
-        }
     }
 
     pub unsafe fn new() -> Self {
@@ -1060,10 +1059,6 @@ impl DynamicLinker {
         index
     }
 
-    pub fn add_object(&mut self, name: String, object: SharedObject) {
-        let _ = self.add_object_with_path(name, None, object);
-    }
-
     pub fn loaded_index(&self, name: &str) -> Option<usize> {
         let base_name = strip_version_suffix(name);
         if base_name != name {
@@ -1274,13 +1269,20 @@ impl DynamicLinker {
             }
         }
 
+        let skip_system_origin_probe =
+            Self::is_shared_object_soname(name) && origin.is_some_and(Self::is_system_bin_dir);
+
         if let Some(origin_dir) = origin {
-            if let Some(found) = Self::open_joined_path(origin_dir, name) {
-                return Some(found);
+            if !skip_system_origin_probe {
+                if let Some(found) = Self::open_joined_path(origin_dir, name) {
+                    return Some(found);
+                }
             }
         }
         if let Some(main_origin) = self.object_origin_dir(0) {
-            if origin != Some(main_origin) {
+            let skip_main_origin_probe =
+                Self::is_shared_object_soname(name) && Self::is_system_bin_dir(main_origin);
+            if origin != Some(main_origin) && !skip_main_origin_probe {
                 if let Some(found) = Self::open_joined_path(main_origin, name) {
                     return Some(found);
                 }
@@ -1304,6 +1306,7 @@ impl DynamicLinker {
                 return Some(((*fallback).to_string(), fd));
             }
         }
+
         None
     }
 
@@ -1360,6 +1363,14 @@ impl DynamicLinker {
                 write::write_str(write::STD_ERR, " -> existing\n");
             }
             return Ok(idx);
+        }
+
+        if allow_selinux_stub
+            && Self::selinux_stub_enabled()
+            && Self::should_stub_selinux_library(name)
+        {
+            self.map_alias(name.to_string(), usize::MAX);
+            return Ok(usize::MAX);
         }
 
         if cfg!(target_arch = "x86_64") && name.starts_with("ld-linux") {
@@ -1430,6 +1441,16 @@ impl DynamicLinker {
         }
 
         Ok(idx)
+    }
+
+    #[inline(always)]
+    fn should_stub_selinux_library(name: &str) -> bool {
+        name == "libselinux.so.1" || name.ends_with("/libselinux.so.1")
+    }
+
+    #[inline(always)]
+    fn selinux_stub_enabled() -> bool {
+        false
     }
 
     pub unsafe fn load_library(
