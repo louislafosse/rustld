@@ -128,8 +128,7 @@ pub unsafe fn indirect_syscall6(
         let result: isize;
         unsafe {
             asm!(
-                "mov qword ptr [rsp - 8], {stub}",
-                "call qword ptr [rsp - 8]",
+                "call {stub}",
                 stub = in(reg) stub,
                 inlateout("rax") nr => result,
                 in("rdi") a1, in("rsi") a2, in("rdx") a3,
@@ -149,8 +148,7 @@ pub unsafe fn indirect_syscall_noreturn(nr: usize, a1: usize) -> ! {
         let stub = trampoline();
         unsafe {
             asm!(
-                "mov qword ptr [rsp - 8], {stub}",
-                "call qword ptr [rsp - 8]",
+                "jmp {stub}",
                 stub = in(reg) stub,
                 in("rax") nr, in("rdi") a1,
                 options(noreturn),

@@ -106,6 +106,7 @@ fn segment_protection_from_flags(p_flags: u32) -> usize {
 /// 1. From a slice of program headers:
 ///
 /// 2. From a file descriptor:
+#[derive(Clone)]
 pub struct SharedObject {
     pub base: usize,
     pub map_start: usize,
@@ -116,6 +117,7 @@ pub struct SharedObject {
     pub dynamic: *const DynamicArrayItem,
     pub relocations: RelocationSlices,
     pub needed_libraries: Vec<usize>, // Indexs into the string table...
+    pub resolved_dependencies: Vec<usize>,
     pub soname: Option<usize>,
     pub rpath: Option<usize>,
     pub runpath: Option<usize>,
@@ -194,6 +196,38 @@ impl SharedObject {
     }
 
     #[inline(always)]
+    fn lookup_tables_look_sane(&self) -> bool {
+        if self.map_start >= self.map_end {
+            return false;
+        }
+
+        let symbol_table_ptr = self.symbol_table.as_ptr() as usize;
+        if self.symbol_count > 0 {
+            if symbol_table_ptr == 0
+                || symbol_table_ptr < self.map_start
+                || symbol_table_ptr >= self.map_end
+            {
+                return false;
+            }
+        }
+
+        let string_table_ptr = self.string_table.into_inner() as usize;
+        if self.string_table_size > 0 {
+            let Some(string_table_end) = string_table_ptr.checked_add(self.string_table_size) else {
+                return false;
+            };
+            if string_table_ptr == 0
+                || string_table_ptr < self.map_start
+                || string_table_end > self.map_end
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[inline(always)]
     fn should_try_non_default_version_fallback(symbol_name: &str) -> bool {
         matches!(
             symbol_name,
@@ -251,24 +285,28 @@ impl SharedObject {
     }
 
     #[inline(always)]
-    fn gnu_hash(name: &str) -> u32 {
+    fn gnu_hash_bytes(name: &[u8]) -> u32 {
         let mut hash: u32 = 5381;
-        for byte in name.bytes() {
-            hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
+        let mut idx = 0usize;
+        while idx < name.len() {
+            hash = hash.wrapping_mul(33).wrapping_add(name[idx] as u32);
+            idx += 1;
         }
         hash
     }
 
     #[inline(always)]
-    fn sysv_hash(name: &str) -> u32 {
+    fn sysv_hash_bytes(name: &[u8]) -> u32 {
         let mut hash: u32 = 0;
-        for byte in name.bytes() {
-            hash = hash.wrapping_shl(4).wrapping_add(byte as u32);
+        let mut idx = 0usize;
+        while idx < name.len() {
+            hash = hash.wrapping_shl(4).wrapping_add(name[idx] as u32);
             let high = hash & 0xF000_0000;
             if high != 0 {
                 hash ^= high >> 24;
             }
             hash &= !high;
+            idx += 1;
         }
         hash
     }
@@ -293,7 +331,7 @@ impl SharedObject {
         let buckets_ptr = header.add(4 + bloom_size * word_u32);
         let chains_ptr = buckets_ptr.add(nbuckets);
 
-        let hash = Self::gnu_hash(symbol_name);
+        let hash = Self::gnu_hash_bytes(symbol_name.as_bytes());
         let word_bits = usize::BITS as usize;
         let bloom_word = *bloom_ptr.add((hash as usize / word_bits) % bloom_size);
         let bloom_mask = (1usize << (hash as usize % word_bits))
@@ -341,7 +379,7 @@ impl SharedObject {
 
         let buckets_ptr = table.add(2);
         let chains_ptr = buckets_ptr.add(nbucket);
-        let hash = Self::sysv_hash(symbol_name) as usize;
+        let hash = Self::sysv_hash_bytes(symbol_name.as_bytes()) as usize;
         let mut sym_idx = *buckets_ptr.add(hash % nbucket) as usize;
 
         let mut steps = 0usize;
@@ -377,7 +415,9 @@ impl SharedObject {
 
         for sym_idx in 0..self.symbol_count {
             let symbol = self.symbol_table.get_ref(sym_idx);
-            if !self.symbol_is_precomputed_exported(sym_idx) {
+            if !Self::symbol_is_exported(symbol)
+                || !Self::symbol_version_is_exported_raw(self.versym, sym_idx)
+            {
                 continue;
             }
             let name = self.string_table.get_bytes(symbol.st_name as usize);
@@ -424,7 +464,7 @@ impl SharedObject {
         }
         let requested = symbol_name.as_bytes();
 
-        let hash = Self::sysv_hash(Self::symbol_base_name(symbol_name)) as usize;
+        let hash = Self::sysv_hash_bytes(Self::symbol_base_name(symbol_name).as_bytes()) as usize;
         let bucket_idx = hash % self.sysv_export_buckets.len();
         let candidates = &self.sysv_export_buckets[bucket_idx];
         for &sym_idx_u32 in candidates {
@@ -451,7 +491,7 @@ impl SharedObject {
         }
         let requested = symbol_name.as_bytes();
 
-        let hash = Self::sysv_hash(Self::symbol_base_name(symbol_name)) as usize;
+        let hash = Self::sysv_hash_bytes(Self::symbol_base_name(symbol_name).as_bytes()) as usize;
         let bucket_idx = hash % self.sysv_export_any_version_buckets.len();
         let candidates = &self.sysv_export_any_version_buckets[bucket_idx];
         for &sym_idx_u32 in candidates {
@@ -472,13 +512,24 @@ impl SharedObject {
     }
 
     #[inline(always)]
+    fn disable_indexed_export_lookup() -> bool {
+        static DISABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLE.get_or_init(|| std::env::var("RUSTLD_ENABLE_INDEXED_EXPORT_LOOKUP").is_err())
+    }
+
+    #[inline(always)]
     pub unsafe fn lookup_exported_symbol(&self, symbol_name: &str) -> Option<Symbol> {
         if symbol_name.is_empty() {
             return None;
         }
+        if !self.lookup_tables_look_sane() {
+            return None;
+        }
 
-        if let Some(symbol) = self.lookup_exported_symbol_indexed(symbol_name) {
-            return Some(symbol);
+        if !Self::disable_indexed_export_lookup() {
+            if let Some(symbol) = self.lookup_exported_symbol_indexed(symbol_name) {
+                return Some(symbol);
+            }
         }
 
         if !self.gnu_hash.is_null() {
@@ -503,9 +554,31 @@ impl SharedObject {
         // Keep this fallback narrow: scanning full symbol tables on every miss
         // is expensive in relocation hot paths.
         if Self::should_try_non_default_version_fallback(symbol_name) {
-            if let Some(symbol) = self.lookup_exported_symbol_indexed_any_version(symbol_name) {
-                return Some(symbol);
+            if !Self::disable_indexed_export_lookup() {
+                if let Some(symbol) = self.lookup_exported_symbol_indexed_any_version(symbol_name) {
+                    return Some(symbol);
+                }
             }
+            return self.lookup_exported_symbol_linear_any_version(symbol_name);
+        }
+
+        None
+    }
+
+    #[inline(always)]
+    pub unsafe fn lookup_exported_symbol_slow(&self, symbol_name: &str) -> Option<Symbol> {
+        if symbol_name.is_empty() {
+            return None;
+        }
+
+        // The rtld/libdl "slow" lookup path is not latency-sensitive, but it is
+        // exercised during glibc NSS runtime loading on newer hosts. Keep it on
+        // the simplest implementation so it does not depend on hash-table state.
+        if let Some(symbol) = self.lookup_exported_symbol_linear(symbol_name) {
+            return Some(symbol);
+        }
+
+        if Self::should_try_non_default_version_fallback(symbol_name) {
             return self.lookup_exported_symbol_linear_any_version(symbol_name);
         }
 
@@ -751,6 +824,47 @@ impl SharedObject {
 
                         if zero_start < zero_page_start {
                             let partial_zero_end = min(zero_page_start, zero_end);
+                            let page_start = page_size::get_page_start(zero_start);
+                            let page_len = zero_page_start.saturating_sub(page_start);
+                            let prefix_len = zero_start.saturating_sub(page_start);
+
+                            // Avoid writing directly into the file-backed partial tail page.
+                            // Some host/kernel combinations are unhappy about zeroing the
+                            // beyond-EOF bytes of that mapping in place, so rebuild the page
+                            // as anonymous memory, restore the initialized prefix, and then
+                            // zero the BSS tail.
+                            let mut prefix = Vec::with_capacity(prefix_len);
+                            prefix.set_len(prefix_len);
+                            core::ptr::copy_nonoverlapping(
+                                page_start as *const u8,
+                                prefix.as_mut_ptr(),
+                                prefix_len,
+                            );
+
+                            let page_addr = page_start as *mut u8;
+                            let mapped = mmap::mmap(
+                                page_addr,
+                                page_len,
+                                protection,
+                                mmap::MAP_PRIVATE | mmap::MAP_ANONYMOUS | mmap::MAP_FIXED,
+                                -1,
+                                0,
+                            );
+                            if mapped != page_addr {
+                                write::write_str(
+                                    write::STD_ERR,
+                                    "Error: could not remap PT_LOAD partial bss page\n",
+                                );
+                                exit::exit(1);
+                            }
+
+                            if prefix_len > 0 {
+                                core::ptr::copy_nonoverlapping(
+                                    prefix.as_ptr(),
+                                    page_addr,
+                                    prefix_len,
+                                );
+                            }
                             core::ptr::write_bytes(
                                 zero_start as *mut u8,
                                 0,
@@ -943,7 +1057,7 @@ impl SharedObject {
 
         let mut sysv_export_buckets: Vec<SmallVec<[u32; 4]>> = Vec::new();
         let mut sysv_export_any_version_buckets: Vec<SmallVec<[u32; 4]>> = Vec::new();
-        if !sysv_hash_pointer.is_null() && symbol_count > 0 {
+        if !Self::disable_indexed_export_lookup() && !sysv_hash_pointer.is_null() && symbol_count > 0 {
             let table = sysv_hash_pointer;
             let nbucket = *table as usize;
             let nchain = *table.add(1) as usize;
@@ -1018,6 +1132,7 @@ impl SharedObject {
                 relr_slice,
             },
             needed_libraries,
+            resolved_dependencies: Vec::new(),
             soname,
             rpath,
             runpath,
@@ -1056,6 +1171,7 @@ impl SharedObject {
                 relr_slice: &[],
             },
             needed_libraries: Vec::new(),
+            resolved_dependencies: Vec::new(),
             soname: None,
             rpath: None,
             runpath: None,
@@ -1145,20 +1261,20 @@ impl SharedObject {
             }
         }
 
-        if let Some(init_offset) = init_fn {
-            let addr = self.base.wrapping_add(init_offset);
-            #[cfg(debug_assertions)]
-            {
-                eprintln!("init: DT_INIT addr=0x{addr:016x} base=0x{:016x}", self.base);
+            if let Some(init_offset) = init_fn {
+                let addr = self.base.wrapping_add(init_offset);
+                #[cfg(debug_assertions)]
+                {
+                    eprintln!("init: DT_INIT addr=0x{addr:016x} base=0x{:016x}", self.base);
+                }
+                let func: extern "C" fn(
+                    usize,
+                    *const *const u8,
+                    *const *const u8,
+                    *const crate::start::auxiliary_vector::AuxiliaryVectorItem,
+                ) = core::mem::transmute(addr);
+                func(arg_count, arg_pointer, env_pointer, auxv_pointer);
             }
-            let func: extern "C" fn(
-                usize,
-                *const *const u8,
-                *const *const u8,
-                *const crate::start::auxiliary_vector::AuxiliaryVectorItem,
-            ) = core::mem::transmute(addr);
-            func(arg_count, arg_pointer, env_pointer, auxv_pointer);
-        }
 
         if !init_array_ptr.is_null() && init_array_count > 0 {
             let init_array_addr = init_array_ptr as usize;

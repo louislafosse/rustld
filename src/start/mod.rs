@@ -32,7 +32,7 @@ use core::cmp::{max, min};
 use std::os::unix::fs::MetadataExt;
 use std::{
     ffi::c_char,
-    ffi::{CStr, CString},
+    ffi::{c_void, CStr, CString},
     fs,
     mem::size_of,
     path::Path,
@@ -70,15 +70,9 @@ unsafe fn dependency_init_order(linker: &DynamicLinker, start_idx: usize) -> Sma
         state[idx] = 1;
 
         let object = &linker.objects[idx];
-        for &needed_offset in &object.needed_libraries {
-            let needed_name = unsafe { object.string_table.get(needed_offset) };
-            if needed_name.is_empty() {
-                continue;
-            }
-            if let Some(dep_idx) = linker.loaded_index(needed_name) {
-                if dep_idx < linker.objects.len() && dep_idx != idx {
-                    visit(dep_idx, start_idx, linker, state, order);
-                }
+        for &dep_idx in &object.resolved_dependencies {
+            if dep_idx < linker.objects.len() && dep_idx != idx {
+                visit(dep_idx, start_idx, linker, state, order);
             }
         }
 
@@ -275,18 +269,27 @@ unsafe fn launch_target_from_bytes(
             .as_deref()
             .map(interpreter_name)
             .unwrap_or("");
+        let mut resolved_dependencies = Vec::with_capacity(needed_offsets.len());
         for needed_offset in needed_offsets {
             let lib_name = executable_string_table.get(needed_offset);
             if lib_name.is_empty() {
                 continue;
             }
+            let lib_name = lib_name.to_string();
             // For glibc targets, keep PT_INTERP out of dependency loading.
             // For musl targets, PT_INTERP is also the libc DSO and must be loaded.
             if !musl_target && !interp_name.is_empty() && lib_name == interp_name {
                 continue;
             }
-            linker.load_library(lib_name, pseudorandom_bytes, Some(executable_idx));
+            if let Some(dep_idx) =
+                linker.load_library_with_requester(&lib_name, Some(executable_idx), true).ok()
+            {
+                if dep_idx < linker.objects.len() && dep_idx != executable_idx {
+                    resolved_dependencies.push(dep_idx);
+                }
+            }
         }
+        linker.objects[executable_idx].resolved_dependencies = resolved_dependencies;
 
         let interpreter_base = loaded_interpreter_base(&linker, &image);
         if interpreter_base != 0 {
@@ -399,6 +402,8 @@ unsafe fn launch_target_from_bytes(
             #[cfg(target_arch = "x86_64")]
             patch_libc_copy_thresholds(&linker);
             call_libc_early_init(&linker);
+            #[cfg(target_arch = "x86_64")]
+            seed_glibc_thread_locale(&linker);
         }
 
         // Call init arrays for shared libraries (dependencies first).
@@ -440,7 +445,8 @@ unsafe fn launch_target_from_bytes(
                     write::write_str(write::STD_ERR, name);
                     write::write_str(write::STD_ERR, "\n");
                 }
-                linker.objects[idx].call_init_functions(target_argc, new_argv, new_envp, new_auxv);
+                linker.objects[idx]
+                    .call_init_functions(target_argc, new_argv, new_envp, new_auxv);
                 #[cfg(debug_assertions)]
                 {
                     use crate::libc::fs::write;
@@ -594,6 +600,11 @@ unsafe fn collect_startup_symbol_writes(
     let short = unsafe { program_invocation_short_name(argv0) };
     writes.push(("program_invocation_short_name", short as usize));
     writes.push(("__progname", short as usize));
+
+    if let Some(hook) = unsafe { linker.rtld_dlfcn_hook() } {
+        writes.push(("_dl_open_hook", hook));
+        writes.push(("_dl_open_hook2", hook));
+    }
 
     if let Some(obj_addr) = unsafe { symbol_address_any(linker, "_IO_2_1_stdin_") } {
         writes.push(("stdin", obj_addr));
@@ -851,6 +862,37 @@ unsafe fn call_libc_early_init(linker: &DynamicLinker) {
             write::write_str(write::STD_ERR, "loader: __libc_early_init missing\n");
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn seed_glibc_thread_locale(linker: &DynamicLinker) {
+    type UselocaleFn = extern "C" fn(*mut c_void) -> *mut c_void;
+
+    let symbol = linker
+        .lookup_symbol("__uselocale")
+        .or_else(|| linker.lookup_symbol("uselocale"));
+    let Some((lib_idx, sym)) = symbol else {
+        return;
+    };
+
+    const SHN_ABS: u16 = 0xfff1;
+    let base = if sym.st_shndx == SHN_ABS {
+        0
+    } else {
+        linker.get_base(lib_idx)
+    };
+    let func_addr = base.wrapping_add(sym.st_value);
+    if func_addr == 0 {
+        return;
+    }
+
+    // `uselocale((locale_t)-1)` tells glibc to install the process-global
+    // locale object into this thread's TLS slots. Older glibc builds keep the
+    // current-locale pointer and derived ctype pointers in libc static TLS;
+    // rustld-created child threads inherit those runtime-populated words from
+    // the main thread during `_dl_allocate_tls*`.
+    let uselocale_fn: UselocaleFn = core::mem::transmute(func_addr);
+    let _ = uselocale_fn(usize::MAX as *mut c_void);
 }
 
 #[cfg(target_arch = "x86_64")]

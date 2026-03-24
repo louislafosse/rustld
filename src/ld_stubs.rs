@@ -3,7 +3,6 @@ use crate::libc::fs::write;
 /// Stub implementations of _dl_* symbols that glibc expects from the dynamic linker
 /// These are minimal no-op implementations to allow programs to run
 use crate::{
-    arch,
     elf::symbol::Symbol,
     elf::thread_local_storage::ThreadControlBlock,
     elf::{header::ElfHeader, program_header::ProgramHeader},
@@ -11,8 +10,8 @@ use crate::{
     syscall::thread_pointer::get_thread_pointer,
     tls,
 };
-use core::ffi::{c_char, c_void};
-use core::mem::{size_of, MaybeUninit};
+use core::ffi::{c_char, c_long, c_void};
+use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 const SHN_ABS: u16 = 0xfff1;
@@ -42,7 +41,7 @@ struct CatchErrorFrame {
     env: SigJmpBuf,
     objname: *mut *const c_char,
     errstring: *mut *const c_char,
-    mallocedp: *mut i32,
+    mallocedp: *mut u8,
     errcode: i32,
 }
 
@@ -79,8 +78,6 @@ static mut RTLD_LOOKUP_MAP: LookupLinkMap = LookupLinkMap {
     l_name: core::ptr::null(),
     l_ld: core::ptr::null(),
 };
-static mut RTLD_LOOKUP_SYMBOL: MaybeUninit<Symbol> = MaybeUninit::uninit();
-
 static mut DLERROR_BUF: [u8; 256] = [0; 256];
 static mut DLERROR_PENDING: bool = false;
 const DLERROR_BUF_SIZE: usize = 256;
@@ -169,6 +166,50 @@ fn resolve_tunable_forward_addr(
 
     cache.store(resolved, Ordering::Relaxed);
     Some(resolved)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn seed_current_glibc_thread_locale() {
+    type UselocaleFn = extern "C" fn(*mut c_void) -> *mut c_void;
+    type CTypeInitFn = extern "C" fn();
+
+    let uselocale_addr = unsafe {
+        linking::lookup_active_symbol("__uselocale")
+            .or_else(|| linking::lookup_active_symbol("uselocale"))
+    };
+    if let Some(addr) = uselocale_addr {
+        let uselocale_fn: UselocaleFn = unsafe { core::mem::transmute(addr) };
+        let _ = uselocale_fn(usize::MAX as *mut c_void);
+    }
+
+    let ctype_init_addr = unsafe { linking::lookup_active_symbol("__ctype_init") };
+    if let Some(addr) = ctype_init_addr {
+        let ctype_init_fn: CTypeInitFn = unsafe { core::mem::transmute(addr) };
+        ctype_init_fn();
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn seed_current_glibc_thread_locale() {}
+
+#[inline(always)]
+fn trace_thread_tls() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("RUSTLD_TRACE_THREAD_TLS").is_ok())
+}
+
+#[inline(always)]
+fn force_fresh_thread_tls() -> bool {
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| std::env::var("RUSTLD_FORCE_FRESH_THREAD_TLS").is_ok())
+}
+
+#[inline(always)]
+fn trace_rtld_lookup() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("RUSTLD_TRACE_RTLD_LOOKUP").is_ok())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -351,6 +392,16 @@ fn resolve_host_rtld_symbol(symbol_name: &str) -> Option<usize> {
     Some(base.wrapping_add(value))
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn host_rtld_global_ro_ptr() -> Option<*const u8> {
+    resolve_host_rtld_symbol("_rtld_global_ro").map(|addr| addr as *const u8)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn host_rtld_global_ro_ptr() -> Option<*const u8> {
+    None
+}
+
 struct RtldOpGuard {
     tid: i32,
     locked: bool,
@@ -378,12 +429,12 @@ impl Drop for RtldOpGuard {
 
 #[inline(always)]
 fn current_tid() -> i32 {
-    arch::gettid()
+    unsafe { syscall(SYS_GETTID) as i32 }
 }
 
 #[inline(always)]
 fn current_pid() -> i32 {
-    arch::getpid()
+    unsafe { syscall(SYS_GETPID) as i32 }
 }
 
 #[inline(always)]
@@ -392,7 +443,7 @@ fn thread_still_alive(tid: i32) -> bool {
         return false;
     }
     // tgkill(pid, tid, 0): kernel existence check for a specific thread.
-    let rc = arch::tgkill(current_pid(), tid, 0);
+    let rc = unsafe { syscall(SYS_TGKILL, current_pid() as c_long, tid as c_long, 0 as c_long) };
     // 0 => exists; -ESRCH => does not exist; other errors conservatively treated as alive.
     rc == 0 || rc != -3
 }
@@ -551,6 +602,11 @@ fn lock_rtld_ops() -> RtldOpGuard {
     }
 }
 
+#[inline]
+fn persist_rtld_lookup_symbol(symbol: Symbol) -> *const Symbol {
+    Box::into_raw(Box::new(symbol))
+}
+
 #[no_mangle]
 pub static mut __rustld_last_alloc_tls_enter: *mut () = core::ptr::null_mut();
 #[no_mangle]
@@ -564,8 +620,23 @@ extern "C" {
     #[link_name = "__sigsetjmp"]
     fn sigsetjmp(env: *mut SigJmpBuf, savemask: i32) -> i32;
     fn siglongjmp(env: *mut SigJmpBuf, val: i32) -> !;
+    fn syscall(number: c_long, ...) -> c_long;
     static __ehdr_start: ElfHeader;
 }
+
+#[cfg(target_arch = "x86_64")]
+const SYS_GETPID: c_long = 39;
+#[cfg(target_arch = "x86_64")]
+const SYS_GETTID: c_long = 186;
+#[cfg(target_arch = "x86_64")]
+const SYS_TGKILL: c_long = 234;
+
+#[cfg(target_arch = "aarch64")]
+const SYS_GETPID: c_long = 172;
+#[cfg(target_arch = "aarch64")]
+const SYS_GETTID: c_long = 178;
+#[cfg(target_arch = "aarch64")]
+const SYS_TGKILL: c_long = 131;
 
 #[repr(C)]
 struct DtvEntry {
@@ -1218,6 +1289,7 @@ fn log_suspicious_runtime_symbol(api: &str, name: &str, resolved: usize) {
 fn dlopen_impl(file_ptr: *const u8, _mode: i32) -> *mut c_void {
     let _guard = lock_rtld_ops();
     clear_dlerror();
+    seed_current_glibc_thread_locale();
 
     if file_ptr.is_null() {
         // glibc returns a handle for the main program on dlopen(NULL, ...).
@@ -1316,19 +1388,31 @@ pub extern "C" fn __rustld_rtld_lookup_dispatch_impl(
                 let requester_idx =
                     linker.object_index_for_link_map_ptr(undef_map_raw as *const c_void);
                 let skip_idx = linker.object_index_for_link_map_ptr(skip_map_raw as *const c_void);
+                if trace_rtld_lookup() {
+                    eprintln!(
+                        "rtld_lookup: name={} undef_map={:#x} requester={:?} skip_map={:#x} skip={:?}",
+                        name,
+                        undef_map_raw,
+                        requester_idx,
+                        skip_map_raw,
+                        skip_idx
+                    );
+                }
                 let resolve = |candidate: &str| {
                     if let Some(requester) = requester_idx {
-                        linker.lookup_symbol_for_object_excluding(requester, candidate, skip_idx)
+                        linker.lookup_symbol_in_object_scope_excluding_rtld_slow(
+                            requester,
+                            candidate,
+                            skip_idx,
+                        )
                     } else {
                         linker.lookup_symbol_excluding(candidate, skip_idx)
                     }
                 };
 
-                let mut matched_name = name;
-                let resolved = if let Some(found) = resolve(matched_name) {
+                let resolved = if let Some(found) = resolve(name) {
                     Some(found)
                 } else if let Some((base_name, _)) = name.split_once('@') {
-                    matched_name = base_name;
                     resolve(base_name)
                 } else {
                     None
@@ -1344,15 +1428,7 @@ pub extern "C" fn __rustld_rtld_lookup_dispatch_impl(
                     RTLD_LOOKUP_MAP.l_name = linker.object_link_map_name_ptr(obj_idx);
                     RTLD_LOOKUP_MAP.l_ld = linker.objects[obj_idx].dynamic.cast::<u8>();
                     let map_ptr = linker.object_link_map_ptr(obj_idx);
-                    let sym_ptr = linker
-                        .lookup_symbol_entry_ptr_in_object(obj_idx, matched_name)
-                        .unwrap_or_else(|| {
-                            core::ptr::write(
-                                core::ptr::addr_of_mut!(RTLD_LOOKUP_SYMBOL).cast::<Symbol>(),
-                                symbol,
-                            );
-                            core::ptr::addr_of!(RTLD_LOOKUP_SYMBOL).cast::<Symbol>()
-                        });
+                    let sym_ptr = persist_rtld_lookup_symbol(symbol);
 
                     if !reference.is_null() {
                         *reference = sym_ptr.cast();
@@ -1705,11 +1781,20 @@ pub extern "C" fn _dl_allocate_tls(_mem: *mut ()) -> *mut () {
         __rustld_last_alloc_tls_enter = _mem;
     }
     unsafe {
+        if trace_thread_tls() {
+            eprintln!("ld_stub: _dl_allocate_tls mem={:#x}", _mem as usize);
+        }
         // When glibc passes a preallocated thread descriptor buffer, initialize
         // TLS in-place. pthread startup paths continue to use this pointer as TP.
-        if !_mem.is_null() {
+        if !_mem.is_null() && !force_fresh_thread_tls() {
             if let Some(initialized) = tls::initialize_tls_for_thread_ptr(_mem) {
                 let result = initialized.cast();
+                if trace_thread_tls() {
+                    eprintln!(
+                        "ld_stub: _dl_allocate_tls in-place ret={:#x}",
+                        result as usize
+                    );
+                }
                 __rustld_last_alloc_tls_ret = result;
                 return result;
             }
@@ -1718,6 +1803,9 @@ pub extern "C" fn _dl_allocate_tls(_mem: *mut ()) -> *mut () {
         // Fallback for callers that do not provide a thread descriptor buffer.
         if let Some(tcb) = tls::allocate_tls_for_new_thread() {
             let result = tcb.cast();
+            if trace_thread_tls() {
+                eprintln!("ld_stub: _dl_allocate_tls fresh ret={:#x}", result as usize);
+            }
             __rustld_last_alloc_tls_ret = result;
             return result;
         }
@@ -1733,6 +1821,13 @@ pub extern "C" fn _dl_allocate_tls_init(tcb: *mut (), _main_thread: usize) -> *m
     unsafe {
         __rustld_last_alloc_tls_init_arg = tcb;
         let current_tp = get_thread_pointer();
+        if trace_thread_tls() {
+            eprintln!(
+                "ld_stub: _dl_allocate_tls_init arg={:#x} current_tp={:#x}",
+                tcb as usize,
+                current_tp as usize
+            );
+        }
         // glibc may call this for the current thread descriptor during startup/
         // teardown bookkeeping. For current-thread calls, only reinitialize
         // when the descriptor's DTV/static TLS view is clearly stale.
@@ -1749,6 +1844,12 @@ pub extern "C" fn _dl_allocate_tls_init(tcb: *mut (), _main_thread: usize) -> *m
                         tls::stamp_thread_tid(initialized);
                     }
                     let result = initialized.cast();
+                    if trace_thread_tls() {
+                        eprintln!(
+                            "ld_stub: _dl_allocate_tls_init ret={:#x}",
+                            result as usize
+                        );
+                    }
                     __rustld_last_alloc_tls_init_ret = result;
                     return result;
                 }
@@ -1802,7 +1903,7 @@ pub extern "C" fn _dl_signal_error(
             core::ptr::write_unaligned(frame.errstring, _errstring);
         }
         if !frame.mallocedp.is_null() {
-            core::ptr::write_unaligned(frame.mallocedp, 0);
+            core::ptr::write_unaligned(frame.mallocedp, 0u8);
         }
         // Avoid keeping rtld lock held across non-local jump.
         force_unlock_rtld_ops_if_owned_by_current_thread();
@@ -1925,7 +2026,7 @@ pub extern "C" fn _dl_catch_exception(
 pub extern "C" fn _dl_catch_error(
     objname: *mut *const c_char,
     errstring: *mut *const c_char,
-    mallocedp: *mut i32,
+    mallocedp: *mut u8,
     operate: *const (),
     args: *const (),
 ) -> i32 {
@@ -1992,7 +2093,7 @@ pub extern "C" fn __rustld_rtld_dlclose_stub(_map: *mut c_void) -> i32 {
 pub extern "C" fn __rustld_rtld_catch_error(
     objname: *mut *const c_char,
     errstring: *mut *const c_char,
-    mallocedp: *mut i32,
+    mallocedp: *mut u8,
     operate: *const c_void,
     args: *mut c_void,
 ) -> i32 {
@@ -2004,7 +2105,7 @@ pub extern "C" fn __rustld_rtld_catch_error(
         unsafe { core::ptr::write_unaligned(errstring, core::ptr::null()) };
     }
     if !mallocedp.is_null() {
-        unsafe { core::ptr::write_unaligned(mallocedp, 0) };
+        unsafe { core::ptr::write_unaligned(mallocedp, 0u8) };
     }
 
     let mut frame = CatchErrorFrame {

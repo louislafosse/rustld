@@ -1,8 +1,6 @@
 use core::mem::size_of;
-use memchr::memchr;
 use phf::phf_map;
 use rustc_hash::FxHashMap;
-
 use crate::{
     elf::{relocate::Relocatable, symbol::Symbol},
     io_macros::syscall_assert,
@@ -22,6 +20,95 @@ pub struct CopyReloc {
     pub destination_address: usize,
     pub source_address: usize,
     pub size: usize,
+}
+
+#[inline(always)]
+fn trace_runtime_nss() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("RUSTLD_TRACE_RUNTIME_NSS").is_ok())
+}
+
+#[inline(always)]
+fn trace_runtime_all() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("RUSTLD_TRACE_RUNTIME_ALL").is_ok())
+}
+
+#[inline(always)]
+fn is_runtime_nss_name(name: &str) -> bool {
+    let file_name = std::path::Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    file_name.starts_with("libnss_")
+}
+
+fn should_trace_runtime_nss_object(linker: &DynamicLinker, object_index: usize) -> bool {
+    if !(trace_runtime_nss() || trace_runtime_all()) {
+        return false;
+    }
+
+    if trace_runtime_all() {
+        return true;
+    }
+
+    let path = linker.object_path(object_index).unwrap_or("");
+    if is_runtime_nss_name(path) {
+        return true;
+    }
+
+    unsafe { linker.objects[object_index].soname_str() }
+        .map(is_runtime_nss_name)
+        .unwrap_or(false)
+}
+
+fn maps_line_for_address(address: usize) -> Option<String> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let mut parts = line.split_whitespace();
+        let range = parts.next()?;
+        let (start, end) = range.split_once('-')?;
+        let start = usize::from_str_radix(start, 16).ok()?;
+        let end = usize::from_str_radix(end, 16).ok()?;
+        if start <= address && address < end {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
+#[inline(always)]
+fn write_dec(fd: i32, mut value: usize) {
+    let mut buf = [0u8; 32];
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value > 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    unsafe {
+        crate::libc::fs::write::write_str(
+            fd,
+            core::str::from_utf8_unchecked(&buf[idx..]),
+        );
+    }
+}
+
+#[inline(always)]
+fn write_isize(fd: i32, value: isize) {
+    if value < 0 {
+        unsafe {
+            crate::libc::fs::write::write_str(fd, "-");
+        }
+        write_dec(fd, value.unsigned_abs());
+    } else {
+        write_dec(fd, value as usize);
+    }
 }
 
 /// Get the address of a stub symbol provided by the dynamic linker
@@ -201,6 +288,77 @@ impl SymbolLookupCache {
     }
 }
 
+#[inline(always)]
+fn relocation_target_is_valid(
+    linker: &DynamicLinker,
+    object_index: usize,
+    relocate_address: usize,
+    write_size: usize,
+) -> bool {
+    if object_index >= linker.objects.len() || write_size == 0 {
+        return false;
+    }
+    let Some(end) = relocate_address.checked_add(write_size.saturating_sub(1)) else {
+        return false;
+    };
+    let object = &linker.objects[object_index];
+    object.contains_address(relocate_address) && object.contains_address(end)
+}
+
+#[cold]
+fn invalid_relocation_target(
+    linker: &DynamicLinker,
+    object_index: usize,
+    relocate_address: usize,
+    write_size: usize,
+    reloc_type: u32,
+    symbol_name: Option<&str>,
+) -> ! {
+    use crate::libc::fs::write;
+
+    unsafe {
+        write::write_str(write::STD_ERR, "rustld: invalid relocation target object=");
+        if let Some(path) = linker.object_path(object_index) {
+            write::write_str(write::STD_ERR, path);
+        } else {
+            write::write_str(write::STD_ERR, "<unknown object>");
+        }
+        write::write_str(write::STD_ERR, " reloc_type=");
+        write_hex(write::STD_ERR, reloc_type as usize);
+        write::write_str(write::STD_ERR, " addr=");
+        write_hex(write::STD_ERR, relocate_address);
+        write::write_str(write::STD_ERR, " size=");
+        write_hex(write::STD_ERR, write_size);
+        if let Some(name) = symbol_name {
+            write::write_str(write::STD_ERR, " symbol=");
+            write::write_str(write::STD_ERR, name);
+        }
+        write::write_str(write::STD_ERR, "\n");
+    }
+    exit::exit(127);
+}
+
+#[inline(always)]
+fn assert_relocation_target(
+    linker: &DynamicLinker,
+    object_index: usize,
+    relocate_address: usize,
+    write_size: usize,
+    reloc_type: u32,
+    symbol_name: Option<&str>,
+) {
+    if !relocation_target_is_valid(linker, object_index, relocate_address, write_size) {
+        invalid_relocation_target(
+            linker,
+            object_index,
+            relocate_address,
+            write_size,
+            reloc_type,
+            symbol_name,
+        );
+    }
+}
+
 fn resolve_tls_symbol(
     object_index: usize,
     symbol: Symbol,
@@ -225,11 +383,15 @@ fn resolve_tls_symbol(
 
 #[inline(always)]
 fn symbol_without_version<'a>(name: &'a str) -> &'a str {
-    if let Some(idx) = memchr(b'@', name.as_bytes()) {
-        &name[..idx]
-    } else {
-        name
+    let bytes = name.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'@' {
+            return &name[..idx];
+        }
+        idx += 1;
     }
+    name
 }
 
 #[inline(always)]
@@ -367,6 +529,56 @@ fn apply_relr_relocations(base: usize, relr_slice: &[usize]) {
     }
 }
 
+fn apply_relr_relocations_checked(
+    base: usize,
+    relr_slice: &[usize],
+    linker: &DynamicLinker,
+    object_index: usize,
+) {
+    if relr_slice.is_empty() {
+        return;
+    }
+
+    let word_size = size_of::<usize>();
+    let addr_bits = usize::BITS as usize;
+    let mut where_addr = 0usize;
+
+    for &entry in relr_slice {
+        if entry & 1 == 0 {
+            where_addr = base.wrapping_add(entry);
+            assert_relocation_target(
+                linker,
+                object_index,
+                where_addr,
+                word_size,
+                8,
+                None,
+            );
+            unsafe {
+                let value = core::ptr::read(where_addr as *const usize);
+                core::ptr::write(where_addr as *mut usize, value.wrapping_add(base));
+            }
+            where_addr = where_addr.wrapping_add(word_size);
+        } else {
+            let mut bitmap = entry >> 1;
+            let mut bit = 0usize;
+            while bitmap != 0 {
+                if bitmap & 1 != 0 {
+                    let addr = where_addr.wrapping_add(bit * word_size);
+                    assert_relocation_target(linker, object_index, addr, word_size, 8, None);
+                    unsafe {
+                        let value = core::ptr::read(addr as *const usize);
+                        core::ptr::write(addr as *mut usize, value.wrapping_add(base));
+                    }
+                }
+                bitmap >>= 1;
+                bit += 1;
+            }
+            where_addr = where_addr.wrapping_add((addr_bits - 1) * word_size);
+        }
+    }
+}
+
 /// Relocate an object with cross-library symbol resolution
 pub unsafe fn relocate_with_linker(
     object: &impl Relocatable,
@@ -377,6 +589,7 @@ pub unsafe fn relocate_with_linker(
     lookup_cache: &mut SymbolLookupCache,
 ) {
     let relocation_slices = object.relocation_slices();
+    let trace_runtime_nss = should_trace_runtime_nss_object(linker, object_index);
 
     #[cfg(debug_assertions)]
     {
@@ -430,8 +643,61 @@ pub unsafe fn relocate_with_linker(
             let end_page = ((max_addr + 7 + page_size - 1) / page_size) * page_size; // +7 for 8-byte relocation
             let length = end_page - start_page;
 
+            if trace_runtime_nss {
+                let path = linker.object_path(object_index).unwrap_or("<unknown>");
+                let map_line = maps_line_for_address(min_addr)
+                    .or_else(|| maps_line_for_address(start_page))
+                    .unwrap_or_else(|| "<no-maps-line>".to_string());
+                let (relr_min, relr_max) =
+                    relr_address_range(object.base(), relocation_slices.relr_slice)
+                        .unwrap_or((0, 0));
+                use crate::libc::fs::write;
+                write::write_str(write::STD_ERR, "runtime_nss:reloc:mprotect:start idx=");
+                write_dec(write::STD_ERR, object_index);
+                write::write_str(write::STD_ERR, " path=");
+                write::write_str(write::STD_ERR, path);
+                write::write_str(write::STD_ERR, " base=");
+                write_hex(write::STD_ERR, object.base());
+                write::write_str(write::STD_ERR, " min=");
+                write_hex(write::STD_ERR, min_addr);
+                write::write_str(write::STD_ERR, " max=");
+                write_hex(write::STD_ERR, max_addr);
+                write::write_str(write::STD_ERR, " start=");
+                write_hex(write::STD_ERR, start_page);
+                write::write_str(write::STD_ERR, " len=");
+                write_hex(write::STD_ERR, length);
+                write::write_str(write::STD_ERR, " rela=");
+                write_dec(write::STD_ERR, relocation_slices.rela_slice.len());
+                write::write_str(write::STD_ERR, " relr=");
+                write_dec(write::STD_ERR, relocation_slices.relr_slice.len());
+                write::write_str(write::STD_ERR, " relr_min=");
+                write_hex(write::STD_ERR, relr_min);
+                write::write_str(write::STD_ERR, " relr_max=");
+                write_hex(write::STD_ERR, relr_max);
+                write::write_str(write::STD_ERR, " map=");
+                write::write_str(write::STD_ERR, &map_line);
+                write::write_str(write::STD_ERR, "\n");
+            }
+
             // Make the region writable
             let result = mprotect(start_page as *mut u8, length, PROT_READ | PROT_WRITE);
+
+            if trace_runtime_nss {
+                let path = linker.object_path(object_index).unwrap_or("<unknown>");
+                let map_line = maps_line_for_address(min_addr)
+                    .or_else(|| maps_line_for_address(start_page))
+                    .unwrap_or_else(|| "<no-maps-line>".to_string());
+                use crate::libc::fs::write;
+                write::write_str(write::STD_ERR, "runtime_nss:reloc:mprotect:done idx=");
+                write_dec(write::STD_ERR, object_index);
+                write::write_str(write::STD_ERR, " path=");
+                write::write_str(write::STD_ERR, path);
+                write::write_str(write::STD_ERR, " result=");
+                write_isize(write::STD_ERR, result);
+                write::write_str(write::STD_ERR, " map=");
+                write::write_str(write::STD_ERR, &map_line);
+                write::write_str(write::STD_ERR, "\n");
+            }
 
             if result < 0 {
                 use crate::libc::fs::write;
@@ -527,6 +793,14 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>(),
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
                 if should_keep_weak_init_fini_undef(symbol, symbol_name) {
                     core::ptr::write(relocate_address as *mut usize, rela.r_addend as usize);
                     continue;
@@ -608,6 +882,14 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>(),
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
                 if should_keep_weak_init_fini_undef(symbol, symbol_name) {
                     core::ptr::write(relocate_address as *mut usize, 0);
                     continue;
@@ -682,41 +964,6 @@ pub unsafe fn relocate_with_linker(
                     )
                 };
 
-                // Debug: show what we're writing where
-                #[cfg(debug_assertions)]
-                {
-                    use crate::libc::fs::write;
-                    write::write_str(write::STD_ERR, "  GOT[");
-                    // print relocate_address as hex
-                    let mut buf = [0u8; 18];
-                    buf[0] = b'0';
-                    buf[1] = b'x';
-                    let hex = b"0123456789abcdef";
-                    let mut addr = relocate_address;
-                    for i in (0..16).rev() {
-                        buf[2 + i] = hex[addr & 0xF];
-                        addr >>= 4;
-                    }
-                    write::write_str(write::STD_ERR, core::str::from_utf8_unchecked(&buf));
-                    write::write_str(write::STD_ERR, "] = ");
-                    // print value
-                    let mut buf2 = [0u8; 18];
-                    buf2[0] = b'0';
-                    buf2[1] = b'x';
-                    let mut val = relocate_value;
-                    for i in (0..16).rev() {
-                        buf2[2 + i] = hex[val & 0xF];
-                        val >>= 4;
-                    }
-                    write::write_str(write::STD_ERR, core::str::from_utf8_unchecked(&buf2));
-                    write::write_str(write::STD_ERR, " ");
-                    write::write_str(write::STD_ERR, symbol_name);
-                    if symbol_type == STT_GNU_IFUNC {
-                        write::write_str(write::STD_ERR, " (IFUNC)");
-                    }
-                    write::write_str(write::STD_ERR, "\n");
-                }
-
                 if symbol_type == STT_GNU_IFUNC {
                     // IFUNC symbols resolve to executable code addresses only after
                     // calling the resolver function. Defer this to the global IFUNC
@@ -730,6 +977,14 @@ pub unsafe fn relocate_with_linker(
                 }
             }
             R_X86_64_RELATIVE => {
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>(),
+                    rela.r_type(),
+                    None,
+                );
                 let relocate_value = object.base().wrapping_add_signed(rela.r_addend);
                 core::ptr::write(relocate_address as *mut usize, relocate_value);
             }
@@ -738,6 +993,14 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>(),
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
 
                 if let Some((lib_idx, resolved_symbol)) = lookup_symbol_any(
                     linker,
@@ -765,6 +1028,14 @@ pub unsafe fn relocate_with_linker(
                 }
             }
             R_X86_64_IRELATIVE => {
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>(),
+                    rela.r_type(),
+                    None,
+                );
                 let function_pointer = object.base().wrapping_add_signed(rela.r_addend);
                 ifuncs.push(IrelativeReloc {
                     relocate_address,
@@ -777,6 +1048,14 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>(),
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
                 let (def_idx, _def_sym) =
                     resolve_tls_symbol(object_index, symbol, symbol_name, linker, lookup_cache);
                 let module_id = linker.objects[def_idx]
@@ -792,6 +1071,18 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    if rela.r_type() == R_X86_64_DTPOFF32 {
+                        size_of::<u32>()
+                    } else {
+                        size_of::<usize>()
+                    },
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
                 let (_def_idx, def_sym) =
                     resolve_tls_symbol(object_index, symbol, symbol_name, linker, lookup_cache);
                 let relocate_value = def_sym.st_value.wrapping_add_signed(rela.r_addend);
@@ -808,6 +1099,18 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    if rela.r_type() == R_X86_64_TPOFF32 {
+                        size_of::<u32>()
+                    } else {
+                        size_of::<usize>()
+                    },
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
                 let (def_idx, def_sym) =
                     resolve_tls_symbol(object_index, symbol, symbol_name, linker, lookup_cache);
                 let tls_offset = linker.objects[def_idx]
@@ -840,6 +1143,14 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>() * 2,
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
                 let (def_idx, def_sym) =
                     resolve_tls_symbol(object_index, symbol, symbol_name, linker, lookup_cache);
                 let module_id = linker.objects[def_idx]
@@ -856,6 +1167,14 @@ pub unsafe fn relocate_with_linker(
             }
             R_X86_64_TLSLD => {
                 // TLS Local Dynamic: module only, offset = 0
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>() * 2,
+                    rela.r_type(),
+                    None,
+                );
                 let module_id = linker.objects[object_index]
                     .tls
                     .as_ref()
@@ -870,6 +1189,14 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>(),
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
                 let (def_idx, def_sym) =
                     resolve_tls_symbol(object_index, symbol, symbol_name, linker, lookup_cache);
                 let tls_offset = linker.objects[def_idx]
@@ -890,6 +1217,14 @@ pub unsafe fn relocate_with_linker(
                 let symbol_name = linker.objects[object_index]
                     .string_table
                     .get(symbol.st_name as usize);
+                assert_relocation_target(
+                    linker,
+                    object_index,
+                    relocate_address,
+                    size_of::<usize>() * 2,
+                    rela.r_type(),
+                    Some(symbol_name),
+                );
                 let (def_idx, def_sym) =
                     resolve_tls_symbol(object_index, symbol, symbol_name, linker, lookup_cache);
                 let (module_id, tls_offset) = linker.objects[def_idx]
@@ -957,7 +1292,7 @@ pub unsafe fn relocate_with_linker(
     }
 
     // Apply packed RELR relocations (R_*_RELATIVE)
-    apply_relr_relocations(object.base(), relocation_slices.relr_slice);
+    apply_relr_relocations_checked(object.base(), relocation_slices.relr_slice, linker, object_index);
 
     #[cfg(debug_assertions)]
     {

@@ -3,7 +3,6 @@ use core::{
     ptr::null_mut,
     sync::atomic::{AtomicI32, AtomicU32, Ordering},
 };
-
 use crate::{
     elf::thread_local_storage::ThreadControlBlock,
     shared_object::SharedObject,
@@ -13,6 +12,12 @@ use crate::{
     },
     utils::round_up_to_boundary,
 };
+
+#[inline(always)]
+fn trace_thread_tls() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("RUSTLD_TRACE_THREAD_TLS").is_ok())
+}
 
 #[cfg(target_arch = "x86_64")]
 const GLIBC_PTHREAD_TID_OFFSET: usize = 0x2d0;
@@ -86,6 +91,7 @@ struct TlsModuleTemplate {
     align: usize,
     block_offset: usize,
     dynamic: bool,
+    inherit_runtime_head: usize,
 }
 
 static mut TLS_STATE: Option<TlsState> = None;
@@ -494,6 +500,7 @@ pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [
 
     let mut modules = Vec::new();
     for obj in objects.iter() {
+        let is_libc = obj.soname_str() == Some("libc.so.6");
         if let Some(tls) = obj.tls {
             modules.push(TlsModuleTemplate {
                 module_id: tls.module_id,
@@ -503,6 +510,16 @@ pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [
                 align: tls.align,
                 block_offset: tls.block_offset,
                 dynamic: false,
+                // glibc stores current locale/ctype pointers in the leading
+                // bytes of libc's static TLS block. Copy only that narrow head
+                // so child threads inherit required runtime-populated words
+                // without cloning unrelated thread-private libc TLS state such
+                // as malloc arena ownership.
+                inherit_runtime_head: if is_libc {
+                    0x40
+                } else {
+                    0
+                },
             });
         }
     }
@@ -802,6 +819,17 @@ unsafe fn initialize_tls_block(
     #[allow(static_mut_refs)]
     let state = TLS_STATE.as_ref()?;
 
+    if trace_thread_tls() {
+        eprintln!(
+            "tls:init clone_full_tcb={} tls_base={:#x} tcb={:#x} state_tcb={:#x} dtv_len={}",
+            clone_full_tcb,
+            tls_base as usize,
+            tcb as usize,
+            state.tcb as usize,
+            state.dtv_len
+        );
+    }
+
     if state.tcb.is_null() || state.dtv_len == 0 {
         return None;
     }
@@ -826,6 +854,13 @@ unsafe fn initialize_tls_block(
             }
             if module.filesz > 0 {
                 core::ptr::copy_nonoverlapping(module.init_image, dst, module.filesz);
+            }
+            if !clone_full_tcb && module.inherit_runtime_head != 0 && !state.tls_base.is_null() {
+                let inherit_len = module.inherit_runtime_head.min(module.memsz);
+                if inherit_len != 0 {
+                    let src = state.tls_base.add(module.block_offset);
+                    core::ptr::copy_nonoverlapping(src, dst, inherit_len);
+                }
             }
             if clone_full_tcb && module.memsz > module.filesz {
                 core::ptr::write_bytes(dst.add(module.filesz), 0, module.memsz - module.filesz);
@@ -872,6 +907,38 @@ unsafe fn initialize_tls_block(
         (*tcb).stack_guard = (*state.tcb).stack_guard;
         (*tcb).pointer_guard = (*state.tcb).pointer_guard;
     }
+
+    #[cfg(target_arch = "x86_64")]
+    if !clone_full_tcb {
+        // Some older glibc pthread startup paths hand us an in-place thread
+        // descriptor before these header words are fully seeded. Fill the
+        // minimal self-referential fields when still zero, but preserve any
+        // non-zero glibc state already written into the surrounding block.
+        if (*tcb).tcb.is_null() {
+            (*tcb).tcb = tcb;
+        }
+        if (*tcb).self_ptr.is_null() {
+            (*tcb).self_ptr = tcb;
+        }
+        if (*tcb).multiple_threads == 0 {
+            (*tcb).multiple_threads = 1;
+        }
+        (*tcb).sysinfo = (*state.tcb).sysinfo;
+        (*tcb).stack_guard = (*state.tcb).stack_guard;
+        (*tcb).pointer_guard = (*state.tcb).pointer_guard;
+        if trace_thread_tls() {
+            eprintln!(
+                "tls:init in-place header tcb={:#x} self={:#x} mt={} sysinfo={:#x} stack_guard={:#x} ptr_guard={:#x}",
+                (*tcb).tcb as usize,
+                (*tcb).self_ptr as usize,
+                (*tcb).multiple_threads,
+                (*tcb).sysinfo,
+                (*tcb).stack_guard,
+                (*tcb).pointer_guard
+            );
+        }
+    }
+
     // Keep this write for both paths so __tls_get_addr observes the DTV that
     // belongs to this thread, while preserving glibc-owned thread-descriptor
     // internals when clone_full_tcb=false.
@@ -898,8 +965,19 @@ unsafe fn initialize_tls_block(
         // when we preserve the rest of the caller-provided pthread block.
         let rseq_area = (tcb as *mut u8).offset(GLIBC_RSEQ_AREA_OFFSET);
         core::ptr::write_bytes(rseq_area, 0, GLIBC_RSEQ_AREA_SIZE);
+        if trace_thread_tls() {
+            eprintln!("tls:init in-place rseq_area={:#x}", rseq_area as usize);
+        }
     }
     register_thread_tcb(tcb);
+
+    if trace_thread_tls() {
+        eprintln!(
+            "tls:init done tcb={:#x} dtv={:#x}",
+            tcb as usize,
+            tcb_read_dtv_ptr(tcb) as usize
+        );
+    }
 
     Some(tcb)
 }
@@ -982,7 +1060,7 @@ pub unsafe fn register_runtime_tls_modules(
     let _guard = lock_tls_state();
     #[allow(static_mut_refs)]
     let state = TLS_STATE.as_mut().ok_or("rustld: TLS state unavailable")?;
-    let layout = TLS_LAYOUT.ok_or("rustld: TLS layout unavailable")?;
+    let _layout = TLS_LAYOUT.ok_or("rustld: TLS layout unavailable")?;
     if state.tcb.is_null() || state.dtv.is_null() || state.dtv_len == 0 {
         return Err("rustld: invalid TLS state");
     }
@@ -997,6 +1075,7 @@ pub unsafe fn register_runtime_tls_modules(
     let mut new_modules = Vec::new();
 
     for obj in objects.iter_mut() {
+        let is_libc = obj.soname_str() == Some("libc.so.6");
         let Some(ref mut tls) = obj.tls else {
             continue;
         };
@@ -1005,19 +1084,13 @@ pub unsafe fn register_runtime_tls_modules(
         }
 
         tls.module_id = next_module_id;
-        let align = tls.align.max(align_of::<usize>());
-        let static_off = round_up_to_boundary(state.runtime_static_cursor, align);
-        let static_end = static_off.saturating_add(tls.memsz);
-        let static_tls_fits = static_end <= layout.runtime_static_end;
-
-        if static_tls_fits {
-            tls.block_offset = static_off;
-            tls.offset = (tls.block_offset as isize).wrapping_sub(layout.tls_size as isize);
-            state.runtime_static_cursor = static_end;
-        } else {
-            tls.offset = 0;
-            tls.block_offset = 0;
-        }
+        // Keep runtime-loaded modules on dynamic TLS. The eager static-TLS
+        // assignment path requires mutating other live threads' TLS blocks and
+        // DTVs, which is not safe under concurrent helper threads (for example
+        // curl's async resolver threads loading NSS modules via dlopen).
+        let static_tls_fits = false;
+        tls.offset = 0;
+        tls.block_offset = 0;
 
         new_modules.push(TlsModuleTemplate {
             module_id: next_module_id,
@@ -1027,6 +1100,11 @@ pub unsafe fn register_runtime_tls_modules(
             align: tls.align,
             block_offset: tls.block_offset,
             dynamic: !static_tls_fits,
+            inherit_runtime_head: if is_libc {
+                0x40
+            } else {
+                0
+            },
         });
         next_module_id += 1;
     }
@@ -1098,80 +1176,6 @@ pub unsafe fn register_runtime_tls_modules(
     state.dtv = new_dtv.cast::<usize>();
     state.dtv_len = new_dtv_len;
     state.modules.extend(new_modules);
-
-    // Propagate newly assigned static TLS blocks to other already-created
-    // threads so direct TP-relative accesses (R_X86_64_TPOFF*) stay valid.
-    let tracked_threads = tracked_threads_snapshot();
-    let snapshot_tid = current_tid();
-    for tcb in tracked_threads {
-        if tcb.is_null() || tcb == current_tcb {
-            continue;
-        }
-        if !is_thread_descriptor_live(tcb, current_tcb, snapshot_tid) {
-            unregister_thread_tcb(tcb);
-            continue;
-        }
-
-        let mut dtv = tcb_read_dtv_ptr(tcb) as *mut DtvEntry;
-        if dtv.is_null() {
-            continue;
-        }
-        let mut capacity = dtv_capacity(dtv);
-        if capacity == 0 {
-            capacity = state.dtv_len;
-            set_dtv_capacity(dtv, capacity);
-        }
-
-        if capacity < new_dtv_len {
-            let expanded_entries = new_dtv_len + 1;
-            let expanded_size = expanded_entries * size_of::<DtvEntry>();
-            let expanded_raw = mmap(
-                null_mut(),
-                expanded_size,
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-                -1,
-                0,
-            ) as *mut DtvEntry;
-            if expanded_raw.is_null() {
-                continue;
-            }
-            core::ptr::write_bytes(expanded_raw.cast::<u8>(), 0, expanded_size);
-            let expanded_dtv = expanded_raw.add(1);
-            core::ptr::copy_nonoverlapping(dtv.sub(1), expanded_raw, capacity + 1);
-            set_dtv_capacity(expanded_dtv, new_dtv_len);
-            (*expanded_dtv).value = (*dtv).value.wrapping_add(1);
-            (*expanded_dtv).to_free = 0;
-            dtv = expanded_dtv;
-            tcb_write_dtv_ptr(tcb, dtv.cast::<usize>());
-            capacity = new_dtv_len;
-        }
-
-        let tls_base = (tcb as *mut u8).sub(layout.tcb_offset);
-        for module in state.modules.iter() {
-            if module.module_id >= capacity {
-                continue;
-            }
-            if module.dynamic {
-                continue;
-            }
-            let existing = (*dtv.add(module.module_id)).value;
-            if existing != 0 {
-                continue;
-            }
-            let dst = tls_base.add(module.block_offset);
-            if module.memsz > 0 {
-                core::ptr::write_bytes(dst, 0, module.memsz);
-                let copy_len = module.filesz.min(module.memsz);
-                if copy_len > 0 {
-                    core::ptr::copy_nonoverlapping(module.init_image, dst, copy_len);
-                }
-            }
-            (*dtv.add(module.module_id)).value =
-                (tls_base as usize).wrapping_add(module.block_offset);
-            (*dtv.add(module.module_id)).to_free = 0;
-        }
-    }
     Ok(())
 }
 

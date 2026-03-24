@@ -5,8 +5,15 @@ use core::{
 use memchr::memchr;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use smartstring::alias::String as SmartString;
-use std::{borrow::Cow, ffi::CStr, ffi::CString, fs, path::Path, ptr::null_mut, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    ffi::CStr,
+    ffi::CString,
+    fs,
+    path::{Path, PathBuf},
+    ptr::null_mut,
+    sync::OnceLock,
+};
 
 use crate::syscall::relocation;
 use crate::{
@@ -114,6 +121,50 @@ static mut ACTIVE_LINKER: *mut DynamicLinker = core::ptr::null_mut();
 static CONFIGURED_LIBRARY_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 static LD_LIBRARY_PATH: OnceLock<Option<String>> = OnceLock::new();
 static RUSTLD_LIBRARY_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+#[inline(always)]
+fn write_trace_hex(mut value: usize) {
+    let mut buf = [0u8; 2 + (size_of::<usize>() * 2)];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for idx in (2..buf.len()).rev() {
+        let digit = (value & 0xf) as u8;
+        buf[idx] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + (digit - 10)
+        };
+        value >>= 4;
+    }
+    unsafe { write::write_str(write::STD_ERR, core::str::from_utf8_unchecked(&buf)) };
+}
+
+#[inline(always)]
+fn write_trace_dec(mut value: usize) {
+    let mut buf = [0u8; 32];
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value > 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    unsafe { write::write_str(write::STD_ERR, core::str::from_utf8_unchecked(&buf[idx..])) };
+}
+
+#[inline(always)]
+fn write_trace_i32(value: i32) {
+    if value < 0 {
+        unsafe { write::write_str(write::STD_ERR, "-") };
+        write_trace_dec(value.unsigned_abs() as usize);
+    } else {
+        write_trace_dec(value as usize);
+    }
+}
 
 #[inline(always)]
 fn strip_version_suffix(name: &str) -> &str {
@@ -257,12 +308,21 @@ fn dynamic_tag_uses_runtime_pointer(tag: usize) -> bool {
     ) || (DT_ADDRRNGLO..=DT_ADDRRNGHI).contains(&tag)
 }
 
-fn legacy_glibc_link_map_needs_absolute_dynamic(path_hint: &str) -> bool {
-    let canonical = fs::canonicalize(path_hint).ok();
-    let candidate = canonical
+fn glibc_dso_version_candidate(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name().map(PathBuf::from);
+    if let Ok(target) = fs::read_link(path) {
+        if let Some(name) = target.file_name() {
+            return Some(PathBuf::from(name));
+        }
+    }
+    file_name
+}
+
+fn glibc_dso_version(path_hint: &str) -> Option<(u32, u32)> {
+    let candidate_buf = glibc_dso_version_candidate(Path::new(path_hint));
+    let candidate = candidate_buf
         .as_ref()
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
+        .and_then(|path| path.to_str())
         .unwrap_or(path_hint);
 
     for prefix in ["libc-", "libpthread-", "libdl-", "ld-"] {
@@ -285,10 +345,14 @@ fn legacy_glibc_link_map_needs_absolute_dynamic(path_hint: &str) -> bool {
         let Ok(minor) = minor_raw.parse::<u32>() else {
             continue;
         };
-        return major == 2 && minor <= 31;
+        return Some((major, minor));
     }
 
-    false
+    None
+}
+
+fn legacy_glibc_link_map_needs_absolute_dynamic(path_hint: &str) -> bool {
+    matches!(glibc_dso_version(path_hint), Some((2, minor)) if minor <= 31)
 }
 
 unsafe fn create_link_map_dynamic_copy(
@@ -352,6 +416,8 @@ struct RtldStubs {
     link_map: *mut u8,
     /// Runtime-adjusted copy of the executable `_DYNAMIC`.
     link_map_dynamic: *mut DynamicArrayItem,
+    /// Legacy glibc dlfcn hook table used by glibc 2.31-era __libc_dlopen_mode.
+    dlfcn_hook: *mut usize,
     /// Storage for standalone ld.so globals referenced by libc.
     libc_enable_secure: *mut u32,
     libc_stack_end: *mut *const u8,
@@ -363,6 +429,8 @@ struct RtldStubs {
     pointer_chk_guard_local: *mut usize,
     stack_chk_guard: *mut usize,
     auxv: *const AuxiliaryVectorItem,
+    hwcap: usize,
+    hwcap2: usize,
 }
 
 impl RtldStubs {
@@ -401,6 +469,18 @@ impl RtldStubs {
         let rtld_global_ro = page.byte_add(RTLD_GLOBAL_SIZE);
         let link_map = page.byte_add(RTLD_GLOBAL_SIZE + RTLD_GLOBAL_RO_SIZE);
         let rtld_data = page.byte_add(RTLD_GLOBAL_SIZE + RTLD_GLOBAL_RO_SIZE + STUB_LINK_MAP_SIZE);
+        let dlfcn_hook = link_map.byte_add(0x380) as *mut usize;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Newer glibc IFUNC resolvers read an x86 CPU-feature block from
+            // _rtld_global_ro. Seed our synthetic object from the host loader's
+            // real bytes first, then override the handful of fields rustld must
+            // virtualize (auxv, hooks, TLS metadata, etc.).
+            if let Some(host_rtld_global_ro) = ld_stubs::host_rtld_global_ro_ptr() {
+                core::ptr::copy_nonoverlapping(host_rtld_global_ro, rtld_global_ro, 928);
+            }
+        }
 
         let libc_enable_secure = rtld_data as *mut u32;
         let libc_stack_end = rtld_data.byte_add(0x08) as *mut *const u8;
@@ -415,7 +495,7 @@ impl RtldStubs {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if running_under_valgrind() {
+            if disable_rseq_metadata() {
                 // Valgrind does not model rseq registration like native glibc
                 // startup expects; advertise rseq as disabled in this mode.
                 *rseq_offset = 0;
@@ -455,6 +535,10 @@ impl RtldStubs {
         *(link_map.byte_add(LINK_MAP_L_LD_OFFSET) as *mut *const u8) = link_map_dynamic.cast();
         *(link_map.byte_add(LINK_MAP_L_REAL_OFFSET) as *mut *mut u8) = link_map;
         populate_link_map_dynamic_info(link_map, link_map_dynamic.cast_const());
+        *dlfcn_hook.add(0) = ld_stubs::dlopen as *const () as usize;
+        *dlfcn_hook.add(1) = ld_stubs::dlsym as *const () as usize;
+        *dlfcn_hook.add(2) = ld_stubs::dlclose as *const () as usize;
+        *dlfcn_hook.add(3) = ld_stubs::dlvsym as *const () as usize;
 
         // Set up _rtld_global:
         //   offset 0x00: _dl_ns[0]._ns_loaded = &link_map
@@ -494,11 +578,17 @@ impl RtldStubs {
         //   offset 0x00: _dl_debug_mask = 0 (no debug)
         //   offset 0x18: _dl_pagesize = 4096
         *(rtld_global_ro.byte_add(0x18) as *mut usize) = 4096; // _dl_pagesize
-                                                               // getauxval(AT_HWCAP) fast-path reads this slot.
+        // x86_64 glibc changed _rtld_global_ro getauxval-related offsets
+        // across releases. Populate both the old 2.31-era layout and the
+        // newer layout so distro-specific libc builds can use either path:
+        //
+        //   glibc 2.31: HWCAP @ +0x58, auxv @ +0x60, HWCAP2 @ +0x1c8
+        //   newer glibc: HWCAP @ +0x60, auxv @ +0x68, HWCAP2 @ +0x310
+        //
+        // Default to the newer layout and switch to the legacy one after
+        // we identify an old target glibc family during object loading.
         *(rtld_global_ro.byte_add(0x60) as *mut usize) = hwcap;
-        // getauxval generic path scans this auxv pointer.
         *(rtld_global_ro.byte_add(0x68) as *mut usize) = auxv_storage as usize;
-        // getauxval(AT_HWCAP2) fast-path reads this slot.
         *(rtld_global_ro.byte_add(0x310) as *mut usize) = hwcap2;
         // glibc sysconf(_SC_MINSIGSTKSZ/_SC_SIGSTKSZ) asserts this is non-zero.
         *(rtld_global_ro.byte_add(0x20) as *mut usize) = minsigstacksize.max(2048);
@@ -561,6 +651,7 @@ impl RtldStubs {
             rtld_global_ro,
             link_map,
             link_map_dynamic,
+            dlfcn_hook,
             libc_enable_secure,
             libc_stack_end,
             dl_argv,
@@ -571,6 +662,8 @@ impl RtldStubs {
             pointer_chk_guard_local,
             stack_chk_guard,
             auxv: auxv_storage as *const AuxiliaryVectorItem,
+            hwcap,
+            hwcap2,
         }
     }
 
@@ -594,6 +687,18 @@ impl RtldStubs {
         *self.rseq_flags = flags;
     }
 
+    unsafe fn set_glibc_getauxval_layout(&self, legacy: bool) {
+        if legacy {
+            *(self.rtld_global_ro.byte_add(0x58) as *mut usize) = self.hwcap;
+            *(self.rtld_global_ro.byte_add(0x60) as *mut usize) = self.auxv as usize;
+            *(self.rtld_global_ro.byte_add(0x1C8) as *mut usize) = self.hwcap2;
+        } else {
+            *(self.rtld_global_ro.byte_add(0x60) as *mut usize) = self.hwcap;
+            *(self.rtld_global_ro.byte_add(0x68) as *mut usize) = self.auxv as usize;
+            *(self.rtld_global_ro.byte_add(0x310) as *mut usize) = self.hwcap2;
+        }
+    }
+
     unsafe fn tls_static_metadata(&self) -> (usize, usize) {
         (
             *(self.rtld_global_ro.byte_add(0x2A0) as *const usize),
@@ -604,6 +709,11 @@ impl RtldStubs {
     unsafe fn set_ns_loaded_head(&self, map: *mut u8) {
         *(self.rtld_global.byte_add(0x00) as *mut *mut u8) = map;
     }
+
+    #[inline(always)]
+    fn dlfcn_hook_ptr(&self) -> usize {
+        self.dlfcn_hook as usize
+    }
 }
 
 /// Dynamic linker state - manages all loaded shared objects and symbol resolution
@@ -613,7 +723,7 @@ pub struct DynamicLinker {
     /// Stable alias list used for diagnostics/debug output.
     pub library_map: Vec<(String, usize)>,
     /// Fast lookup table from alias/path to object index.
-    library_alias_index: FxHashMap<SmartString, usize>,
+    library_alias_index: FxHashMap<String, usize>,
     /// Canonical filesystem path per object index (if known).
     object_paths: Vec<Option<String>>,
     /// Stable `struct link_map` stand-ins for loaded objects.
@@ -629,6 +739,101 @@ pub struct DynamicLinker {
 }
 
 impl DynamicLinker {
+    #[inline(always)]
+    fn trace_rtld_lookup() -> bool {
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *TRACE.get_or_init(|| std::env::var("RUSTLD_TRACE_RTLD_LOOKUP").is_ok())
+    }
+
+    #[inline(always)]
+    fn trace_runtime_nss() -> bool {
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *TRACE.get_or_init(|| std::env::var("RUSTLD_TRACE_RUNTIME_NSS").is_ok())
+    }
+
+    #[inline(always)]
+    fn trace_runtime_all() -> bool {
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *TRACE.get_or_init(|| std::env::var("RUSTLD_TRACE_RUNTIME_ALL").is_ok())
+    }
+
+    #[inline(always)]
+    fn is_runtime_nss_name(name: &str) -> bool {
+        let file_name = Path::new(name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(name);
+        file_name.starts_with("libnss_")
+    }
+
+    #[inline(always)]
+    fn allow_unsafe_systemd_nss() -> bool {
+        static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ALLOW.get_or_init(|| std::env::var("RUSTLD_ALLOW_UNSAFE_SYSTEMD_NSS").is_ok())
+    }
+
+    #[inline(always)]
+    fn should_skip_runtime_nss_backend(name: &str) -> bool {
+        if Self::allow_unsafe_systemd_nss() {
+            return false;
+        }
+
+        let file_name = Path::new(name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(name);
+
+        if !file_name.starts_with("libnss_") {
+            return false;
+        }
+
+        !matches!(file_name, "libnss_files.so.2" | "libnss_dns.so.2")
+    }
+
+    fn trace_runtime_nss_object_state(&self, stage: &str, object_index: usize) {
+        if !(Self::trace_runtime_nss() || Self::trace_runtime_all()) || object_index >= self.objects.len() {
+            return;
+        }
+
+        let path = self.object_path(object_index).unwrap_or("<unknown>");
+        let soname = unsafe { self.objects[object_index].soname_str() }.unwrap_or("<none>");
+        if !Self::trace_runtime_all()
+            && !Self::is_runtime_nss_name(path)
+            && !Self::is_runtime_nss_name(soname)
+        {
+            return;
+        }
+
+        let object = &self.objects[object_index];
+        let relocations = object.relocation_slices();
+        let tls = object.tls.as_ref();
+        unsafe {
+            write::write_str(write::STD_ERR, "runtime_nss:");
+            write::write_str(write::STD_ERR, stage);
+            write::write_str(write::STD_ERR, ": idx=");
+            write_trace_dec(object_index);
+            write::write_str(write::STD_ERR, " path=");
+            write::write_str(write::STD_ERR, path);
+            write::write_str(write::STD_ERR, " soname=");
+            write::write_str(write::STD_ERR, soname);
+            write::write_str(write::STD_ERR, " base=");
+            write_trace_hex(object.base);
+            write::write_str(write::STD_ERR, " map=");
+            write_trace_hex(object.map_start);
+            write::write_str(write::STD_ERR, "-");
+            write_trace_hex(object.map_end);
+            write::write_str(write::STD_ERR, " tls_module=");
+            write_trace_dec(tls.map(|value| value.module_id).unwrap_or(0));
+            write::write_str(write::STD_ERR, " tls_memsz=");
+            write_trace_hex(tls.map(|value| value.memsz).unwrap_or(0));
+            write::write_str(write::STD_ERR, " rela=");
+            write_trace_dec(relocations.rela_slice.len());
+            write::write_str(write::STD_ERR, " relr=");
+            write_trace_dec(relocations.relr_slice.len());
+            write::write_str(write::STD_ERR, "\n");
+        }
+    }
+
     #[inline(always)]
     fn musl_libc_fallback_candidates(name: &str) -> &'static [&'static str] {
         if name != "libc.so" {
@@ -668,14 +873,28 @@ impl DynamicLinker {
 
     #[inline(always)]
     fn is_shared_object_soname(name: &str) -> bool {
-        if name.contains('/') {
-            return false;
+        let bytes = name.as_bytes();
+        for &byte in bytes {
+            if byte == b'/' {
+                return false;
+            }
         }
         let base = name.rsplit('/').next().unwrap_or(name);
         if base.starts_with("ld-linux") || base.starts_with("ld-musl") {
             return true;
         }
-        base.starts_with("lib") && base.contains(".so")
+        if !base.starts_with("lib") {
+            return false;
+        }
+        let base = base.as_bytes();
+        let mut i = 0usize;
+        while i + 2 < base.len() {
+            if base[i] == b'.' && base[i + 1] == b's' && base[i + 2] == b'o' {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     #[inline(always)]
@@ -858,6 +1077,36 @@ impl DynamicLinker {
         (argc, argv, env, auxv)
     }
 
+    pub unsafe fn rtld_dlfcn_hook(&self) -> Option<usize> {
+        self.rtld_stubs
+            .as_ref()
+            .map(|stubs| stubs.dlfcn_hook_ptr())
+    }
+
+    fn resolve_object_dependency_indices(&self, idx: usize) -> SmallVec<[usize; 16]> {
+        let mut deps = SmallVec::<[usize; 16]>::new();
+        if idx >= self.objects.len() {
+            return deps;
+        }
+
+        let object = &self.objects[idx];
+        for &needed_offset in &object.needed_libraries {
+            let needed_name = unsafe { object.string_table.get(needed_offset) };
+            if needed_name.is_empty() {
+                continue;
+            }
+            let Some(dep_idx) = self.loaded_index(needed_name) else {
+                continue;
+            };
+            if dep_idx >= self.objects.len() || dep_idx == idx || deps.contains(&dep_idx) {
+                continue;
+            }
+            deps.push(dep_idx);
+        }
+
+        deps
+    }
+
     unsafe fn dependency_init_order(&self, start_idx: usize) -> SmallVec<[usize; 32]> {
         fn visit(
             idx: usize,
@@ -875,16 +1124,9 @@ impl DynamicLinker {
             }
             state[idx] = 1;
 
-            let object = &linker.objects[idx];
-            for &needed_offset in &object.needed_libraries {
-                let needed_name = unsafe { object.string_table.get(needed_offset) };
-                if needed_name.is_empty() {
-                    continue;
-                }
-                if let Some(dep_idx) = linker.loaded_index(needed_name) {
-                    if dep_idx < linker.objects.len() && dep_idx != idx {
-                        visit(dep_idx, start_idx, linker, state, order);
-                    }
+            for dep_idx in linker.resolve_object_dependency_indices(idx) {
+                if dep_idx < linker.objects.len() && dep_idx != idx {
+                    visit(dep_idx, start_idx, linker, state, order);
                 }
             }
 
@@ -924,25 +1166,20 @@ impl DynamicLinker {
             order.push(idx);
         }
 
-        let object = &self.objects[idx];
-        for &needed_offset in &object.needed_libraries {
-            let needed_name = unsafe { object.string_table.get(needed_offset) };
-            if needed_name.is_empty() {
-                continue;
-            }
-            if let Some(dep_idx) = self.loaded_index(needed_name) {
-                if dep_idx < self.objects.len() && dep_idx != idx {
-                    self.visit_scope_indices(dep_idx, seen, order);
-                }
+        for dep_idx in self.resolve_object_dependency_indices(idx) {
+            if dep_idx < self.objects.len() && dep_idx != idx {
+                self.visit_scope_indices(dep_idx, seen, order);
             }
         }
     }
 
     pub fn rebuild_lookup_scopes(&mut self) {
         let object_count = self.objects.len();
-        self.lookup_scopes.clear();
-        self.lookup_scopes.resize_with(object_count, Vec::new);
+        let mut new_lookup_scopes = Vec::with_capacity(object_count);
+        new_lookup_scopes.resize_with(object_count, Vec::new);
         if object_count == 0 {
+            let old_lookup_scopes = core::mem::replace(&mut self.lookup_scopes, new_lookup_scopes);
+            core::mem::forget(old_lookup_scopes);
             return;
         }
 
@@ -964,8 +1201,11 @@ impl DynamicLinker {
                     order.push(idx);
                 }
             }
-            self.lookup_scopes[requester] = order;
+            new_lookup_scopes[requester] = order;
         }
+
+        let old_lookup_scopes = core::mem::replace(&mut self.lookup_scopes, new_lookup_scopes);
+        core::mem::forget(old_lookup_scopes);
     }
 
     /// Initialize the rtld stubs using the executable's base and dynamic section.
@@ -1002,7 +1242,7 @@ impl DynamicLinker {
         let layout = tls::tls_layout();
         if let Some(stubs) = self.rtld_stubs.as_ref() {
             #[cfg(target_arch = "x86_64")]
-            if running_under_valgrind() {
+            if disable_rseq_metadata() || self.loaded_legacy_glibc_family() {
                 stubs.set_rseq_metadata(0, 0, 0);
             } else {
                 stubs.set_rseq_metadata(-192, 32, 0);
@@ -1040,15 +1280,12 @@ impl DynamicLinker {
             .file_name()
             .and_then(|name| name.to_str())
             .map(|value| value.to_owned());
-        let alias_key = SmartString::from(alias.as_str());
-        if self.library_alias_index.insert(alias_key, index).is_none() {
+        if self.library_alias_index.insert(alias.clone(), index).is_none() {
             self.library_map.push((alias, index));
         }
 
         if let Some(base) = base_name {
-            self.library_alias_index
-                .entry(SmartString::from(base.as_str()))
-                .or_insert(index);
+            self.library_alias_index.entry(base).or_insert(index);
         }
     }
 
@@ -1145,7 +1382,6 @@ impl DynamicLinker {
             } else {
                 dynamic_copy
             };
-            core::ptr::write_bytes(map, 0, LINK_MAP_SIZE);
             *(map.byte_add(LINK_MAP_L_ADDR_OFFSET) as *mut usize) = self.objects[index].base;
             *(map.byte_add(LINK_MAP_L_NAME_OFFSET) as *mut *const c_char) = raw_name;
             *(map.byte_add(LINK_MAP_L_LD_OFFSET) as *mut *const c_void) =
@@ -1197,6 +1433,14 @@ impl DynamicLinker {
             .map(|path| path.as_str())
             .unwrap_or(name.as_str())
             .to_string();
+        if let Some(stubs) = self.rtld_stubs.as_ref() {
+            if matches!(glibc_dso_version(&link_name), Some((2, minor)) if minor <= 31) {
+                unsafe {
+                    stubs.set_glibc_getauxval_layout(true);
+                    stubs.set_rseq_metadata(0, 0, 0);
+                }
+            }
+        }
         if self.rtld_stubs.is_some() {
             self.install_link_map_for_object(index, &link_name);
         } else {
@@ -1216,7 +1460,8 @@ impl DynamicLinker {
             self.map_alias(soname.to_string(), index);
         }
         // Topology changed; caller should rebuild scopes before heavy lookup phase.
-        self.lookup_scopes.clear();
+        let old_lookup_scopes = core::mem::take(&mut self.lookup_scopes);
+        core::mem::forget(old_lookup_scopes);
         index
     }
 
@@ -1528,7 +1773,7 @@ impl DynamicLinker {
         Self::open_path(&candidate).map(|fd| (candidate, fd))
     }
 
-    unsafe fn load_library_with_requester(
+    pub(crate) unsafe fn load_library_with_requester(
         &mut self,
         name: &str,
         requester_idx: Option<usize>,
@@ -1612,13 +1857,20 @@ impl DynamicLinker {
         let string_table = object.string_table;
 
         let idx = self.add_object_with_path(name.to_string(), Some(path), object);
+        let mut resolved_dependencies = Vec::with_capacity(needed_offsets.len());
         for needed_offset in needed_offsets {
             let needed_name = string_table.get(needed_offset);
             if needed_name.is_empty() {
                 continue;
             }
-            let _ = self.load_library_with_requester(needed_name, Some(idx), allow_selinux_stub)?;
+            let needed_name = needed_name.to_string();
+            let dep_idx =
+                self.load_library_with_requester(&needed_name, Some(idx), allow_selinux_stub)?;
+            if dep_idx < self.objects.len() && dep_idx != idx {
+                resolved_dependencies.push(dep_idx);
+            }
         }
+        self.objects[idx].resolved_dependencies = resolved_dependencies;
 
         Ok(idx)
     }
@@ -1658,12 +1910,30 @@ impl DynamicLinker {
         name: &str,
         requester_idx: Option<usize>,
     ) -> Result<usize, &'static str> {
+        if Self::should_skip_runtime_nss_backend(name) {
+            if Self::trace_runtime_nss() || Self::trace_runtime_all() {
+                unsafe {
+                    write::write_str(write::STD_ERR, "runtime_nss:skip file=");
+                    write::write_str(write::STD_ERR, name);
+                    write::write_str(write::STD_ERR, "\n");
+                }
+            }
+            return Err("runtime nss backend disabled");
+        }
         self.load_library_with_requester(name, requester_idx, false)
     }
 
     pub unsafe fn dlopen_runtime(&mut self, file: &str, _mode: i32) -> Result<usize, &'static str> {
         if file.is_empty() {
             return Ok(0);
+        }
+
+        if Self::trace_runtime_nss() && Self::is_runtime_nss_name(file) {
+            unsafe {
+                write::write_str(write::STD_ERR, "runtime_nss:dlopen:start file=");
+                write::write_str(write::STD_ERR, file);
+                write::write_str(write::STD_ERR, "\n");
+            }
         }
 
         let start_idx = self.objects.len();
@@ -1675,13 +1945,47 @@ impl DynamicLinker {
             return Ok(root_idx);
         }
 
+        if Self::trace_runtime_nss() {
+            unsafe {
+                write::write_str(write::STD_ERR, "runtime_nss:dlopen:loaded file=");
+                write::write_str(write::STD_ERR, file);
+                write::write_str(write::STD_ERR, " start_idx=");
+                write_trace_dec(start_idx);
+                write::write_str(write::STD_ERR, " root_idx=");
+                write_trace_dec(root_idx);
+                write::write_str(write::STD_ERR, " new_objects=");
+                write_trace_dec(self.objects.len().saturating_sub(start_idx));
+                write::write_str(write::STD_ERR, "\n");
+            }
+            for idx in start_idx..self.objects.len() {
+                self.trace_runtime_nss_object_state("loaded", idx);
+            }
+        }
+
         self.rebuild_lookup_scopes();
 
         let new_objects_have_tls = self.objects[start_idx..]
             .iter()
             .any(|object| object.tls.is_some());
         if new_objects_have_tls {
+            if Self::trace_runtime_nss() {
+                unsafe {
+                    write::write_str(write::STD_ERR, "runtime_nss:tls:register:start root_idx=");
+                    write_trace_dec(root_idx);
+                    write::write_str(write::STD_ERR, "\n");
+                }
+            }
             tls::register_runtime_tls_modules(&mut self.objects[start_idx..])?;
+            if Self::trace_runtime_nss() {
+                unsafe {
+                    write::write_str(write::STD_ERR, "runtime_nss:tls:register:done root_idx=");
+                    write_trace_dec(root_idx);
+                    write::write_str(write::STD_ERR, "\n");
+                }
+                for idx in start_idx..self.objects.len() {
+                    self.trace_runtime_nss_object_state("post-register-tls", idx);
+                }
+            }
         }
 
         let mut ifuncs = Vec::new();
@@ -1695,20 +1999,39 @@ impl DynamicLinker {
             .sum::<usize>()
             .max(1024);
         let mut lookup_cache = relocation::SymbolLookupCache::with_capacity(lookup_cache_capacity);
-        for obj_idx in start_idx..self.objects.len() {
+        let relocation_indices: Vec<usize> = (start_idx..self.objects.len()).collect();
+        for obj_idx in relocation_indices {
+            let object_snapshot = self.objects[obj_idx].clone();
+            self.trace_runtime_nss_object_state("relocate:start", obj_idx);
             relocation::relocate_with_linker(
-                &self.objects[obj_idx],
+                &object_snapshot,
                 obj_idx,
                 self,
                 &mut ifuncs,
                 &mut copies,
                 &mut lookup_cache,
             );
+            self.trace_runtime_nss_object_state("relocate:done", obj_idx);
+            core::mem::forget(object_snapshot);
         }
         relocation::apply_copy_relocations(&copies);
         relocation::apply_irelative_relocations(&ifuncs);
         if new_objects_have_tls {
+            if Self::trace_runtime_nss() {
+                unsafe {
+                    write::write_str(write::STD_ERR, "runtime_nss:tls:finalize:start root_idx=");
+                    write_trace_dec(root_idx);
+                    write::write_str(write::STD_ERR, "\n");
+                }
+            }
             tls::finalize_runtime_tls_images(&self.objects[start_idx..])?;
+            if Self::trace_runtime_nss() {
+                unsafe {
+                    write::write_str(write::STD_ERR, "runtime_nss:tls:finalize:done root_idx=");
+                    write_trace_dec(root_idx);
+                    write::write_str(write::STD_ERR, "\n");
+                }
+            }
         }
 
         // Run init in dependency order rooted at the object requested by
@@ -1839,6 +2162,11 @@ impl DynamicLinker {
 
     const INLINE_SCOPE_SEEN_CAPACITY: usize = 512;
 
+    #[inline(always)]
+    fn is_nss_module_symbol(symbol_name: &str) -> bool {
+        symbol_name.as_bytes().starts_with(b"_nss_")
+    }
+
     #[inline]
     fn with_scope_seen<T>(&self, f: impl FnOnce(&mut [u8]) -> T) -> T {
         let object_count = self.objects.len();
@@ -1865,19 +2193,12 @@ impl DynamicLinker {
             return true;
         }
 
-        let object = &self.objects[idx];
-        for &needed_offset in &object.needed_libraries {
-            let needed_name = unsafe { object.string_table.get(needed_offset) };
-            if needed_name.is_empty() {
-                continue;
-            }
-            if let Some(dep_idx) = self.loaded_index(needed_name) {
-                if dep_idx < self.objects.len()
-                    && dep_idx != idx
-                    && self.visit_scope_preorder(dep_idx, seen, visit)
-                {
-                    return true;
-                }
+        for dep_idx in self.resolve_object_dependency_indices(idx) {
+            if dep_idx < self.objects.len()
+                && dep_idx != idx
+                && self.visit_scope_preorder(dep_idx, seen, visit)
+            {
+                return true;
             }
         }
 
@@ -1947,11 +2268,12 @@ impl DynamicLinker {
         }
 
         // Search loaded objects in global scope order (executable first).
-        for (obj_idx, object) in self.objects.iter().enumerate() {
+        let object_count = self.objects.len();
+        for obj_idx in 0..object_count {
             if exclude_object == Some(obj_idx) {
                 continue;
             }
-            if let Some(symbol) = object.lookup_exported_symbol(symbol_name) {
+            if let Some(symbol) = self.objects[obj_idx].lookup_exported_symbol(symbol_name) {
                 return Some((obj_idx, symbol));
             }
         }
@@ -1976,10 +2298,14 @@ impl DynamicLinker {
         if requester_object >= self.objects.len() {
             return self.lookup_symbol_excluding(symbol_name, exclude_object);
         }
-        if let Some(scope) = self.lookup_scopes.get(requester_object) {
+        let scope_snapshot = self.lookup_scopes.get(requester_object).cloned();
+        if let Some(scope) = scope_snapshot {
             if !scope.is_empty() {
-                for &idx in scope {
+                for idx in scope {
                     if exclude_object == Some(idx) {
+                        continue;
+                    }
+                    if idx >= self.objects.len() {
                         continue;
                     }
                     if let Some(symbol) = self.objects[idx].lookup_exported_symbol(symbol_name) {
@@ -2038,6 +2364,110 @@ impl DynamicLinker {
         })
     }
 
+    pub unsafe fn lookup_symbol_for_object_excluding_rtld_slow(
+        &self,
+        requester_object: usize,
+        symbol_name: &str,
+        exclude_object: Option<usize>,
+    ) -> Option<(usize, Symbol)> {
+        if let Some(resolved) = self.lookup_rtld_stub_symbol(symbol_name) {
+            return Some(resolved);
+        }
+
+        // glibc probes NSS backends for module-specific `_nss_*` entry points.
+        // Those lookups are backend-local; walking dependency scopes can both
+        // return the wrong symbol and force scans through libc for symbols that
+        // are expected to be absent on the module.
+        if Self::is_nss_module_symbol(symbol_name)
+            && requester_object < self.objects.len()
+            && exclude_object != Some(requester_object)
+        {
+            return self.objects[requester_object]
+                .lookup_exported_symbol_slow(symbol_name)
+                .map(|symbol| (requester_object, symbol));
+        }
+
+        let mut candidate_indices = if requester_object < self.lookup_scopes.len() {
+            self.lookup_scopes[requester_object].clone()
+        } else {
+            (0..self.objects.len()).collect()
+        };
+        if candidate_indices.is_empty() {
+            candidate_indices = (0..self.objects.len()).collect();
+        }
+
+        if Self::trace_rtld_lookup() {
+            eprintln!(
+                "rtld_scope: requester={} symbol={} exclude={:?} candidates={:?}",
+                requester_object,
+                symbol_name,
+                exclude_object,
+                candidate_indices
+            );
+        }
+
+        for idx in candidate_indices {
+            if exclude_object == Some(idx) || idx >= self.objects.len() {
+                continue;
+            }
+            if Self::trace_rtld_lookup() {
+                let soname = self.objects[idx].soname_str().unwrap_or("<none>");
+                eprintln!("rtld_scope: try idx={} soname={}", idx, soname);
+            }
+            if let Some(symbol) = self.objects[idx].lookup_exported_symbol_slow(symbol_name) {
+                return Some((idx, symbol));
+            }
+        }
+
+        None
+    }
+
+    pub unsafe fn lookup_symbol_in_object_scope_excluding_rtld_slow(
+        &self,
+        object_index: usize,
+        symbol_name: &str,
+        exclude_object: Option<usize>,
+    ) -> Option<(usize, Symbol)> {
+        if let Some(resolved) = self.lookup_rtld_stub_symbol(symbol_name) {
+            return Some(resolved);
+        }
+
+        if object_index >= self.objects.len() {
+            return self.lookup_symbol_excluding(symbol_name, exclude_object);
+        }
+
+        if Self::is_nss_module_symbol(symbol_name) && exclude_object != Some(object_index) {
+            return self.objects[object_index]
+                .lookup_exported_symbol_slow(symbol_name)
+                .map(|symbol| (object_index, symbol));
+        }
+
+        self.with_scope_seen(|seen| {
+            let mut found = None;
+            let _ = self.visit_scope_preorder(object_index, seen, &mut |idx| {
+                if exclude_object == Some(idx) {
+                    return false;
+                }
+                if Self::trace_rtld_lookup() {
+                    let soname = self.objects[idx].soname_str().unwrap_or("<none>");
+                    eprintln!(
+                        "rtld_handle_scope: root={} symbol={} try idx={} soname={}",
+                        object_index,
+                        symbol_name,
+                        idx,
+                        soname
+                    );
+                }
+                if let Some(symbol) = self.objects[idx].lookup_exported_symbol_slow(symbol_name) {
+                    found = Some((idx, symbol));
+                    return true;
+                }
+                false
+            });
+            found
+        })
+    }
+
     #[inline(always)]
     pub fn get_base(&self, index: usize) -> usize {
         self.objects[index].base
@@ -2090,6 +2520,13 @@ impl DynamicLinker {
             .map(|stubs| stubs.tls_static_metadata())
     }
 
+    fn loaded_legacy_glibc_family(&self) -> bool {
+        self.object_paths
+            .iter()
+            .flatten()
+            .any(|path| matches!(glibc_dso_version(path), Some((2, minor)) if minor <= 31))
+    }
+
     pub fn object_index_for_link_map_ptr(&self, map_ptr: *const c_void) -> Option<usize> {
         if map_ptr.is_null() {
             return None;
@@ -2108,6 +2545,11 @@ pub unsafe fn active_linker() -> Option<&'static DynamicLinker> {
 #[inline(always)]
 fn running_under_valgrind() -> bool {
     arch::running_under_valgrind()
+}
+
+#[inline(always)]
+fn disable_rseq_metadata() -> bool {
+    running_under_valgrind() || std::env::var("RUSTLD_DISABLE_RSEQ").is_ok()
 }
 
 #[inline(always)]

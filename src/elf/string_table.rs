@@ -1,5 +1,4 @@
 use core::{slice, str};
-use memchr::memchr;
 
 /// A collection of null-terminated strings stored in contiguous memory.
 ///
@@ -40,8 +39,9 @@ impl StringTable {
         Self { ptr, size }
     }
 
-    /// Returns "" if ptr is null, index is OOB, or the first byte is NUL.
-    /// SAFETY: `ptr..ptr+size` must be readable. Strings must be valid UTF-8 if you want meaningful `&str`.
+    /// Returns "" if ptr is null, index is OOB, the first byte is NUL, or the
+    /// bytes are not valid UTF-8.
+    /// SAFETY: `ptr..ptr+size` must be readable.
     #[inline(always)]
     pub unsafe fn get(&self, index: usize) -> &'static str {
         // Fast reject: null ptr or OOB
@@ -51,16 +51,16 @@ impl StringTable {
 
         let start = self.ptr.add(index);
         let len_max = self.size - index;
+        let mut len = 0usize;
+        while len < len_max {
+            if *start.add(len) == 0 {
+                break;
+            }
+            len += 1;
+        }
 
-        // Search for NUL using memchr (vectorized / optimized)
-        let bytes = slice::from_raw_parts(start, len_max);
-        let len = match memchr(0, bytes) {
-            Some(p) => p,
-            None => len_max,
-        };
-
-        // Zero-copy UTF-8 view (unchecked)
-        str::from_utf8_unchecked(slice::from_raw_parts(start, len))
+        let bytes = slice::from_raw_parts(start, len);
+        str::from_utf8(bytes).unwrap_or("")
     }
 
     // Use later to optimize string table accesses by avoiding UTF-8 checks when possible.
@@ -72,11 +72,13 @@ impl StringTable {
 
         let start = self.ptr.add(index);
         let len_max = self.size - index;
-        let bytes = slice::from_raw_parts(start, len_max);
-        let len = match memchr(0, bytes) {
-            Some(p) => p,
-            None => len_max,
-        };
+        let mut len = 0usize;
+        while len < len_max {
+            if *start.add(len) == 0 {
+                break;
+            }
+            len += 1;
+        }
         slice::from_raw_parts(start, len)
     }
 
