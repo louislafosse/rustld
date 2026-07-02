@@ -1,21 +1,24 @@
-use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-static mut PAGE_SIZE: MaybeUninit<usize> = MaybeUninit::uninit();
+// 0 means "not yet set"; readers fall back to a 4 KiB default so a lookup
+// before `set_page_size` can never read uninitialized memory.
+static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-pub unsafe fn set_page_size(page_size: usize) {
-    #[allow(static_mut_refs)]
-    PAGE_SIZE.write(page_size);
+pub fn set_page_size(page_size: usize) {
+    PAGE_SIZE.store(page_size, Ordering::Relaxed);
 }
 
-pub unsafe fn get_page_size() -> usize {
-    #[allow(static_mut_refs)]
-    PAGE_SIZE.assume_init_read()
+pub fn get_page_size() -> usize {
+    match PAGE_SIZE.load(Ordering::Relaxed) {
+        0 => 4096,
+        size => size,
+    }
 }
 
-pub unsafe fn get_page_start(address: usize) -> usize {
+pub fn get_page_start(address: usize) -> usize {
     address & !(get_page_size() - 1)
 }
 
-pub unsafe fn get_page_end(address: usize) -> usize {
+pub fn get_page_end(address: usize) -> usize {
     get_page_start(address + get_page_size() - 1)
 }

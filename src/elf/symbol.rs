@@ -56,9 +56,4 @@ impl SymbolTable {
     pub const fn as_ptr(&self) -> *const Symbol {
         self.0
     }
-
-    #[inline(always)]
-    pub const fn into_inner(self) -> *const Symbol {
-        self.0
-    }
 }

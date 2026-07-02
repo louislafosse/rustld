@@ -159,7 +159,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(c_variadic)]
-#![feature(thread_local)]
+// The loader deliberately retains code the compiler cannot see as used:
+// complete ELF constant vocabularies, architecture fallback primitives, the
+// self-relocation path, and hook `static`s invoked only through function
+// pointers or the guest ABI. Keep dead-code analysis quiet for these.
 #![allow(dead_code)]
 
 pub(crate) mod arch;
@@ -177,6 +180,7 @@ mod ld_stubs;
 mod libc;
 mod linking;
 mod page_size;
+pub(crate) mod relocation_common;
 mod shared_object;
 mod start;
 mod tls;

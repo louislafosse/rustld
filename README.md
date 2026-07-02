@@ -115,7 +115,7 @@ sudo dnf -y --use-host-config \
   --repo=fedora --repo=updates \
   --setopt=install_weak_deps=False \
   --setopt=module_platform_id=platform:f43 \
-  install bash coreutils glibc glibc-langpack-en libgcc libstdc++ musl-filesystem musl-libc \
+  install bash coreutils musl-gcc glibc glibc-langpack-en libgcc libstdc++ musl-filesystem musl-libc \
           zlib openssl-libs ca-certificates curl python3
 
 bash tests/build_tests.sh

@@ -28,9 +28,3 @@ pub struct ThreadControlBlock {
     /// libc/pthread code reads fields at offsets well past 0x600.
     pub _padding: [usize; 2048],
 }
-
-#[repr(C)]
-pub union DynamicThreadVectorItem {
-    pub pointer: *mut c_void,
-    pub generation_counter: usize,
-}

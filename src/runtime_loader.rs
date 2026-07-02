@@ -9,6 +9,7 @@ use crate::{
         },
         JumpInfo,
     },
+    utils::fill_random_bytes,
 };
 use core::ptr::null;
 use std::ffi::CString;
@@ -361,17 +362,4 @@ unsafe fn derive_runtime_metadata(auxv_template: &[AuxiliaryVectorItem]) -> Runt
         minsigstacksize,
         pseudorandom_bytes,
     }
-}
-
-unsafe fn fill_random_bytes(buf: *mut u8, len: usize) -> bool {
-    let mut filled = 0usize;
-
-    while filled < len {
-        let ret = arch::getrandom(buf.add(filled), len - filled);
-        if ret <= 0 {
-            return false;
-        }
-        filled += ret as usize;
-    }
-    true
 }

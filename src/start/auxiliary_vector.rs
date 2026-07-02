@@ -65,7 +65,7 @@ impl AuxiliaryVectorIter {
         Self(auxiliary_vector_pointer)
     }
 
-    /// Calculates and initializes a new `AuxiliaryVectorIter` from an `EnvironmentIter`.
+    /// Calculates and initializes a new `AuxiliaryVectorIter` from an environment pointer.
     pub unsafe fn from_env_pointer(env_pointer: impl Into<*const *const u8>) -> Self {
         let mut env_pointer = env_pointer.into();
 
@@ -76,11 +76,6 @@ impl AuxiliaryVectorIter {
 
             Self::new(env_pointer.add(1) as *const AuxiliaryVectorItem)
         }
-    }
-
-    /// Extracts the inner pointer to the next item consuming the `AuxiliaryVectorIter`.
-    pub fn into_inner(self) -> *const AuxiliaryVectorItem {
-        self.0
     }
 }
 

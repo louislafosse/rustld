@@ -68,11 +68,6 @@ impl DynamicArrayIter {
     pub fn new(dynamic_array_pointer: *const DynamicArrayItem) -> Self {
         Self(dynamic_array_pointer)
     }
-
-    /// Extracts the inner pointer to the next item consuming the `DynamicArrayIter`.
-    pub fn into_inner(self) -> *const DynamicArrayItem {
-        self.0
-    }
 }
 
 impl Iterator for DynamicArrayIter {
