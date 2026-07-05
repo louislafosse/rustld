@@ -302,6 +302,22 @@ fn glibc_dso_version_candidate(path: &Path) -> Option<PathBuf> {
 }
 
 fn glibc_dso_version(path_hint: &str) -> Option<(u32, u32)> {
+    // The version probe does a `readlink` on the DSO path; the same handful of
+    // paths (libc.so.6, libm.so.6, the executable) are queried several times
+    // during a load, so memoize to avoid repeating the syscall.
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<(u32, u32)>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().unwrap().get(path_hint) {
+        return *cached;
+    }
+    let result = glibc_dso_version_uncached(path_hint);
+    cache.lock().unwrap().insert(path_hint.to_string(), result);
+    result
+}
+
+fn glibc_dso_version_uncached(path_hint: &str) -> Option<(u32, u32)> {
     let candidate_buf = glibc_dso_version_candidate(Path::new(path_hint));
     let candidate = candidate_buf
         .as_ref()

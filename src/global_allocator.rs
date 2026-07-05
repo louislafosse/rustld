@@ -243,6 +243,18 @@ unsafe impl GlobalAlloc for Allocator {
         }
     }
 
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = self.alloc(layout);
+        // Large, page-bucket and fresh small-class allocations come straight
+        // from kernel-zeroed anonymous mmap (page-cache reuse re-zeros in
+        // `alloc`), so they need no second memset. Only a recycled small-class
+        // block can hold stale bytes; zero just those.
+        if !pointer.is_null() && self.small_class_index(layout).is_some() {
+            core::ptr::write_bytes(pointer, 0, layout.size());
+        }
+        pointer
+    }
+
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         if pointer.is_null() {
             return;

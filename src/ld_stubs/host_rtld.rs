@@ -1,5 +1,7 @@
 #[cfg(target_arch = "x86_64")]
 use super::*;
+#[cfg(target_arch = "x86_64")]
+use crate::syscall::mmap::{mmap, munmap, MAP_PRIVATE, PROT_READ};
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -114,7 +116,14 @@ fn parse_maps_hex(raw: &str) -> Option<usize> {
 
 #[cfg(target_arch = "x86_64")]
 fn find_host_rtld_base_and_path() -> Option<(usize, String)> {
-    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    use std::io::Read;
+    // `/proc/self/maps` reports size 0, so `read_to_string` grows its buffer
+    // from tiny and issues many read syscalls. Read into one pre-sized buffer
+    // instead (2 reads: content + EOF).
+    let mut file = std::fs::File::open("/proc/self/maps").ok()?;
+    let mut buf = Vec::with_capacity(32768);
+    file.read_to_end(&mut buf).ok()?;
+    let maps = std::str::from_utf8(&buf).ok()?;
     for line in maps.lines() {
         if !line.contains("ld-linux") {
             continue;
@@ -153,11 +162,39 @@ fn dynsym_name_matches(candidate: &[u8], wanted: &str) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 fn resolve_dynsym_value(path: &str, symbol_name: &str) -> Option<usize> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() < size_of::<ElfHeader>() {
+    use std::os::unix::io::AsRawFd;
+
+    // Map the host loader read-only instead of copying the whole file onto the
+    // heap. Only the ELF header, section-header table and .dynsym/.dynstr pages
+    // are actually touched; a `std::fs::read` of a ~1 MiB loader previously cost
+    // a large read plus a heap alloc/free (a big mmap + munmap) for bytes we
+    // mostly never look at.
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len() as usize;
+    if len < size_of::<ElfHeader>() {
         return None;
     }
+    let mapped = unsafe {
+        mmap(
+            core::ptr::null_mut(),
+            len,
+            PROT_READ,
+            MAP_PRIVATE,
+            file.as_raw_fd() as isize,
+            0,
+        )
+    };
+    if (mapped as isize) < 0 || mapped.is_null() {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(mapped, len) };
+    let result = resolve_dynsym_value_in(bytes, symbol_name);
+    unsafe { munmap(mapped, len) };
+    result
+}
 
+#[cfg(target_arch = "x86_64")]
+fn resolve_dynsym_value_in(bytes: &[u8], symbol_name: &str) -> Option<usize> {
     let header = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<ElfHeader>()) };
     if header.e_ident[0..4] != [0x7f, b'E', b'L', b'F'] {
         return None;

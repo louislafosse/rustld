@@ -412,7 +412,7 @@ unsafe fn build_and_populate_dtv(
     let dtv_alloc_entries = dtv_len + 1; // +1 header slot for dtv[-1]
     let dtv_size = dtv_alloc_entries * size_of::<DtvEntry>();
     let dtv_raw = mmap_anon(dtv_size)?.cast::<DtvEntry>();
-    core::ptr::write_bytes(dtv_raw.cast::<u8>(), 0, dtv_size);
+    // mmap_anon pages are already zero.
 
     let dtv = dtv_raw.add(1);
     set_dtv_capacity(dtv, dtv_len);
@@ -440,7 +440,7 @@ unsafe fn allocate_tls_module_block(module: &TlsModuleTemplate) -> Option<usize>
     let alloc_len = payload.checked_add(align)?;
 
     let raw = mmap_anon(alloc_len)?;
-    core::ptr::write_bytes(raw, 0, alloc_len);
+    // mmap_anon pages are already zero.
     let base = round_up_to_boundary(raw as usize, align);
 
     if module.filesz > 0 {

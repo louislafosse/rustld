@@ -5,7 +5,7 @@ pub unsafe fn allocate_tls_for_new_thread() -> Option<*mut ThreadControlBlock> {
     let layout = TLS_LAYOUT?;
     let total_size = layout.tcb_offset + size_of::<ThreadControlBlock>() + layout.max_align;
     let raw = mmap_anon(total_size)?;
-    core::ptr::write_bytes(raw, 0, total_size);
+    // mmap_anon pages are already zero.
     let tls_base = round_up_to_boundary(raw as usize, layout.max_align) as *mut u8;
     let tcb = tls_base.add(layout.tcb_offset) as *mut ThreadControlBlock;
     initialize_tls_block(tls_base, tcb, true)

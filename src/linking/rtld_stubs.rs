@@ -20,7 +20,8 @@ impl RtldStubs {
         const TOTAL_SIZE: usize =
             RTLD_GLOBAL_SIZE + RTLD_GLOBAL_RO_SIZE + STUB_LINK_MAP_SIZE + RTLD_DATA_SIZE;
 
-        // Allocate memory for stubs.
+        // Allocate memory for stubs. MAP_ANONYMOUS pages are kernel zero-filled
+        // (and defined-zero to valgrind), so no explicit memset is needed.
         let page = mmap(
             null_mut(),
             TOTAL_SIZE,
@@ -29,8 +30,6 @@ impl RtldStubs {
             -1,
             0,
         );
-        // Ensure memory is initialized for tools like valgrind.
-        core::ptr::write_bytes(page, 0, TOTAL_SIZE);
 
         let rtld_global = page;
         let rtld_global_ro = page.byte_add(RTLD_GLOBAL_SIZE);

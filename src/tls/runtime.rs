@@ -69,7 +69,7 @@ pub unsafe fn register_runtime_tls_modules(
         Some(raw) => raw.cast::<DtvEntry>(),
         None => return Err("rustld: failed to allocate runtime DTV"),
     };
-    core::ptr::write_bytes(new_dtv_raw.cast::<u8>(), 0, new_dtv_size);
+    // mmap_anon pages are already zero.
 
     let new_dtv = new_dtv_raw.add(1);
     set_dtv_capacity(new_dtv, new_dtv_len);
@@ -280,7 +280,7 @@ pub unsafe fn resolve_tls_address(module: usize, offset: usize) -> Option<usize>
             let new_dtv_alloc_entries = new_len + 1; // +1 header slot for dtv[-1]
             let new_dtv_size = new_dtv_alloc_entries * size_of::<DtvEntry>();
             let new_dtv_raw = mmap_anon(new_dtv_size)?.cast::<DtvEntry>();
-            core::ptr::write_bytes(new_dtv_raw.cast::<u8>(), 0, new_dtv_size);
+            // mmap_anon pages are already zero.
             let new_dtv = new_dtv_raw.add(1);
             core::ptr::copy_nonoverlapping(dtv.sub(1), new_dtv_raw, current_len + 1);
             set_dtv_capacity(new_dtv, new_len);

@@ -16,7 +16,7 @@ pub unsafe fn install_tls(objects: &[SharedObject], pseudorandom_bytes: *const [
         Some(raw) => raw,
         None => return,
     };
-    core::ptr::write_bytes(raw, 0, total_size);
+    // `mmap_anon` returns kernel-zeroed anonymous pages; no memset needed.
 
     let tls_base = round_up_to_boundary(raw as usize, layout.max_align) as *mut u8;
 

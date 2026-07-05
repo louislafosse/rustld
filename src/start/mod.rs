@@ -277,6 +277,10 @@ unsafe fn launch_target_from_bytes(
 
         let mut ifuncs = Vec::new();
         let mut copies = Vec::new();
+        // Total relocation count is an upper bound on distinct cached symbols,
+        // so it right-sizes the cache; `with_capacity` applies its own small
+        // floor. Avoid a large fixed floor that over-allocates for small
+        // programs.
         let lookup_cache_capacity = linker
             .objects
             .iter()
@@ -284,8 +288,7 @@ unsafe fn launch_target_from_bytes(
                 let slices = object.relocation_slices();
                 slices.rela_slice.len() + (slices.relr_slice.len() / 2)
             })
-            .sum::<usize>()
-            .max(4096);
+            .sum::<usize>();
         let mut lookup_cache = relocation::SymbolLookupCache::with_capacity(lookup_cache_capacity);
         // Perform relocations for all loaded objects with cross-library symbol resolution
         for obj_idx in 0..linker.objects.len() {

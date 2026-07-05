@@ -62,13 +62,17 @@ unsafe extern "C" fn start_from_stack(sp: *const usize) -> ! {
     }
     new_argv[out] = core::ptr::null();
 
-    // Try fixed workspace fallback paths first.
-    new_argv[0] = FALLBACK_RUSTLD_MAIN.as_ptr();
-    if execve(FALLBACK_RUSTLD_MAIN.as_ptr(), new_argv.as_ptr(), envp) == 0 {
-        exit_now(0);
-    }
+    // Try fixed workspace fallback paths first. The crate ships the runnable
+    // loader as an example (`examples/rustld`), so prefer that path; a `[[bin]]`
+    // build (`target/release/rustld`) is only a secondary fallback. Trying the
+    // non-existent bin path first would cost a wasted ENOENT execve on every
+    // launch.
     new_argv[0] = FALLBACK_RUSTLD_EXAMPLE.as_ptr();
     if execve(FALLBACK_RUSTLD_EXAMPLE.as_ptr(), new_argv.as_ptr(), envp) == 0 {
+        exit_now(0);
+    }
+    new_argv[0] = FALLBACK_RUSTLD_MAIN.as_ptr();
+    if execve(FALLBACK_RUSTLD_MAIN.as_ptr(), new_argv.as_ptr(), envp) == 0 {
         exit_now(0);
     }
 
